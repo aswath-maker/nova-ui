@@ -1,33 +1,41 @@
 """
 Nova GUI Plugin
-================
+===============
 
 Single-file graphical frontend for Nova.
 
-Install as:
+Installation:
+    Copy this file to:
 
-    plugins/gui/plugin.py
+        ~/.nova/plugins/gui/plugin.py
 
-Then launch:
+Windows equivalent:
 
+        C:\\Users\\<username>\\.nova\\plugins\\gui\\plugin.py
+
+Launch:
     nova --ui
 
 Architecture:
-    GUI -> NovaRuntime -> existing Nova model/memory/tools
+    GUI
+      |
+      v
+    NovaRuntime
+      |
+      +-- existing Qwen model
+      +-- existing chat/memory system
+      +-- existing web functionality
+      +-- existing PDF functionality
+      +-- existing thinking functionality
 
-This plugin intentionally does NOT:
-    - create another Qwen/Llama model
-    - create another memory database
-    - directly modify chat JSON files
-    - parse sys.argv
-    - implement a second web/PDF system
-    - replace Nova's core CLI/chat systems
+IMPORTANT:
+    This plugin does not create another model, another memory database,
+    another web system, or another PDF implementation.
 
-The concrete persistent-chat API is not part of the public Nova plugin
-specification supplied to this plugin. Therefore NovaGUIBackend contains
-a small runtime adapter that attempts to discover the existing chat API.
-Once the real Nova source is available, that adapter should be replaced
-with the exact concrete calls from Nova's implementation.
+The concrete persistent-chat API is not explicitly defined by the
+Nova plugin specification, so the backend contains a small adapter
+which attempts to use the existing Nova chat API without creating
+replacement storage.
 """
 
 from __future__ import annotations
@@ -35,7 +43,6 @@ from __future__ import annotations
 import threading
 import traceback
 import tkinter as tk
-from dataclasses import dataclass
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Optional
 
@@ -43,7 +50,7 @@ from plugin_system import NovaPlugin
 
 
 # ============================================================================
-# Metadata
+# Plugin metadata
 # ============================================================================
 
 PLUGIN_NAME = "gui"
@@ -52,23 +59,32 @@ PLUGIN_API_VERSION = 1
 
 
 # ============================================================================
-# Data structures
+# Small internal data classes
+#
+# These are deliberately ordinary Python classes rather than @dataclass.
+# Nova's current plugin loader dynamically imports modules without first
+# inserting them into sys.modules, which is incompatible with dataclasses
+# during decoration.
 # ============================================================================
 
-@dataclass
 class ChatInfo:
-    """A normalized representation of an existing Nova chat."""
+    def __init__(
+        self,
+        name: str,
+        identifier: str,
+    ):
+        self.name = name
+        self.identifier = identifier
 
-    name: str
-    identifier: str
 
-
-@dataclass
 class ChatMessage:
-    """A normalized representation of a stored Nova message."""
-
-    role: str
-    content: str
+    def __init__(
+        self,
+        role: str,
+        content: str,
+    ):
+        self.role = role
+        self.content = content
 
 
 # ============================================================================
@@ -77,33 +93,40 @@ class ChatMessage:
 
 class NovaGUIBackend:
     """
-    Adapter between the GUI and NovaRuntime.
+    Thin adapter between the GUI and NovaRuntime.
 
-    The model-facing API is known from the Nova plugin contract:
-        runtime.ask(...)
-        runtime.think(...)
-        runtime.generate(...)
+    Model access:
+        Uses runtime.ask() and runtime.think().
 
-    Chat-management APIs are not defined in the supplied specification,
-    so this class attempts to discover them without creating replacement
-    storage.
+    Persistent chat access:
+        Attempts to locate the existing Nova chat manager.
 
-    Once the actual Nova source is available, this class is the ONLY part
-    that should normally need adjustment.
+    The adapter intentionally never creates:
+        - gui_chats.json
+        - gui_memory.json
+        - gui_history.json
+        - a second Qwen/Llama model
     """
 
-    def __init__(self, runtime: Any):
+    def __init__(
+        self,
+        runtime: Any,
+    ):
         self.runtime = runtime
 
     # ----------------------------------------------------------------------
-    # Model access
+    # Existing Nova model
     # ----------------------------------------------------------------------
 
-    def ask(self, message: str, thinking: bool = False) -> Any:
+    def ask(
+        self,
+        message: str,
+        thinking: bool = False,
+    ) -> Any:
         """
-        Use Nova's already-loaded model.
+        Ask the existing Nova runtime.
 
-        Never creates another Llama/Qwen instance.
+        No model is instantiated here.
         """
         if thinking:
             return self.runtime.think(message)
@@ -111,15 +134,16 @@ class NovaGUIBackend:
         return self.runtime.ask(message)
 
     # ----------------------------------------------------------------------
-    # Locate existing chat subsystem
+    # Existing chat manager discovery
     # ----------------------------------------------------------------------
 
     def _find_chat_manager(self) -> Any:
         """
-        Find an existing Nova chat/memory manager.
+        Find an existing chat-management object exposed by Nova.
 
-        This is deliberately conservative. We do not create one if it
-        cannot be found.
+        This is deliberately conservative. If no supported object exists,
+        the GUI reports the problem rather than creating replacement
+        persistent storage.
         """
 
         candidates = (
@@ -139,35 +163,41 @@ class NovaGUIBackend:
             if manager is not None:
                 return manager
 
-        # Some implementations may expose the manager as a method.
-        for attribute_name in (
+        # Some implementations may expose a getter instead of a direct
+        # attribute.
+        getter_names = (
             "get_chat_manager",
             "get_chats",
             "get_chat",
-        ):
-            attribute = getattr(
+        )
+
+        for getter_name in getter_names:
+            getter = getattr(
                 self.runtime,
-                attribute_name,
+                getter_name,
                 None,
             )
 
-            if callable(attribute):
-                try:
-                    manager = attribute()
+            if not callable(getter):
+                continue
 
-                    if manager is not None:
-                        return manager
+            try:
+                manager = getter()
 
-                except TypeError:
-                    # It may require an argument, so it isn't a manager
-                    # getter we can use here.
-                    continue
-                except Exception:
-                    continue
+            except TypeError:
+                # Getter probably expects an argument and therefore is
+                # not a manager getter.
+                continue
+
+            except Exception:
+                continue
+
+            if manager is not None:
+                return manager
 
         raise RuntimeError(
             "NovaRuntime does not expose a recognized existing chat API. "
-            "The GUI refuses to create its own chat database."
+            "The GUI will not create a separate chat database."
         )
 
     @staticmethod
@@ -175,6 +205,10 @@ class NovaGUIBackend:
         obj: Any,
         names: tuple[str, ...],
     ):
+        """
+        Find the first callable attribute with one of the provided names.
+        """
+
         for name in names:
             method = getattr(
                 obj,
@@ -188,7 +222,7 @@ class NovaGUIBackend:
         return None
 
     # ----------------------------------------------------------------------
-    # List chats
+    # List existing chats
     # ----------------------------------------------------------------------
 
     def list_chats(self) -> list[ChatInfo]:
@@ -206,16 +240,16 @@ class NovaGUIBackend:
 
         if method is None:
             raise RuntimeError(
-                "Nova's existing chat manager does not expose a supported "
+                "Nova's chat manager does not expose a supported "
                 "chat-listing method."
             )
 
-        chats = method()
+        result = method()
 
-        return self._normalize_chat_list(chats)
+        return self._normalize_chat_list(result)
 
     # ----------------------------------------------------------------------
-    # Load chat
+    # Load existing chat
     # ----------------------------------------------------------------------
 
     def load_chat(
@@ -239,7 +273,7 @@ class NovaGUIBackend:
 
         if method is None:
             raise RuntimeError(
-                "Nova's existing chat manager does not expose a supported "
+                "Nova's chat manager does not expose a supported "
                 "chat-loading method."
             )
 
@@ -248,7 +282,7 @@ class NovaGUIBackend:
         return self._normalize_messages(result)
 
     # ----------------------------------------------------------------------
-    # Create chat
+    # Create existing Nova chat
     # ----------------------------------------------------------------------
 
     def create_chat(
@@ -270,7 +304,7 @@ class NovaGUIBackend:
 
         if method is None:
             raise RuntimeError(
-                "Nova's existing chat manager does not expose a supported "
+                "Nova's chat manager does not expose a supported "
                 "chat-creation method."
             )
 
@@ -282,7 +316,7 @@ class NovaGUIBackend:
         )
 
     # ----------------------------------------------------------------------
-    # Delete chat
+    # Delete existing Nova chat
     # ----------------------------------------------------------------------
 
     def delete_chat(
@@ -304,14 +338,14 @@ class NovaGUIBackend:
 
         if method is None:
             raise RuntimeError(
-                "Nova's existing chat manager does not expose a supported "
+                "Nova's chat manager does not expose a supported "
                 "chat-deletion method."
             )
 
         method(identifier)
 
     # ----------------------------------------------------------------------
-    # Persistent message operation
+    # Send message through existing persistent chat system
     # ----------------------------------------------------------------------
 
     def send_message(
@@ -336,11 +370,10 @@ class NovaGUIBackend:
 
         if method is None:
             raise RuntimeError(
-                "Nova's existing chat manager does not expose a supported "
+                "Nova's chat manager does not expose a supported "
                 "persistent message method."
             )
 
-        # Try the most explicit API shape first.
         attempts = (
             lambda: method(
                 identifier,
@@ -374,12 +407,12 @@ class NovaGUIBackend:
                 continue
 
         raise RuntimeError(
-            "Nova's persistent chat message API does not match any "
-            "supported adapter signature."
+            "Nova's persistent chat message API does not match "
+            "the signatures supported by this GUI adapter."
         ) from last_error
 
     # ----------------------------------------------------------------------
-    # Normalization
+    # Normalize chat list
     # ----------------------------------------------------------------------
 
     @staticmethod
@@ -407,6 +440,10 @@ class NovaGUIBackend:
 
         return result
 
+    # ----------------------------------------------------------------------
+    # Normalize chat object
+    # ----------------------------------------------------------------------
+
     @staticmethod
     def _normalize_chat(
         item: Any,
@@ -416,7 +453,6 @@ class NovaGUIBackend:
         if isinstance(item, ChatInfo):
             return item
 
-        # Some simple Nova APIs may return names directly.
         if isinstance(item, str):
             return ChatInfo(
                 name=item,
@@ -445,8 +481,8 @@ class NovaGUIBackend:
 
             if name is None or identifier is None:
                 raise RuntimeError(
-                    "Nova returned a chat object without a usable name "
-                    "or identifier."
+                    "Nova returned a chat object without a usable "
+                    "name or identifier."
                 )
 
             return ChatInfo(
@@ -469,13 +505,17 @@ class NovaGUIBackend:
 
         if name is None or identifier is None:
             raise RuntimeError(
-                f"Unsupported Nova chat object: {type(item).__name__}"
+                "Nova returned an unsupported chat object."
             )
 
         return ChatInfo(
             name=str(name),
             identifier=str(identifier),
         )
+
+    # ----------------------------------------------------------------------
+    # Normalize message history
+    # ----------------------------------------------------------------------
 
     @staticmethod
     def _normalize_messages(
@@ -519,11 +559,10 @@ class NovaGUIBackend:
                     or "assistant"
                 )
 
-                content = (
-                    item.get("content")
-                    if item.get("content") is not None
-                    else item.get("message")
-                )
+                content = item.get("content")
+
+                if content is None:
+                    content = item.get("message")
 
                 if content is None:
                     continue
@@ -582,7 +621,6 @@ class NovaGUI:
     SIDEBAR_BG = "#ededf0"
     TEXT = "#202123"
     MUTED = "#6f6f78"
-    BORDER = "#d6d6da"
     USER_BG = "#ffffff"
     NOVA_BG = "#eeeeF1"
     ACTIVE_BG = "#ddddE2"
@@ -611,34 +649,16 @@ class NovaGUI:
         )
 
         self.current_chat: Optional[ChatInfo] = None
+
         self.thinking = False
+
         self.generating = False
 
-        self._configure_styles()
         self._build_ui()
 
-    # ------------------------------------------------------------------
-    # Style
-    # ------------------------------------------------------------------
-
-    def _configure_styles(self):
-
-        style = ttk.Style(self.root)
-
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        style.configure(
-            "TButton",
-            font=("Segoe UI", 10),
-            padding=(10, 7),
-        )
-
-    # ------------------------------------------------------------------
-    # Main UI
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # UI setup
+    # ======================================================================
 
     def _build_ui(self):
 
@@ -668,9 +688,9 @@ class NovaGUI:
             self.load_chat_list,
         )
 
-    # ------------------------------------------------------------------
+    # ======================================================================
     # Header
-    # ------------------------------------------------------------------
+    # ======================================================================
 
     def _build_header(self):
 
@@ -713,9 +733,9 @@ class NovaGUI:
             padx=22,
         )
 
-    # ------------------------------------------------------------------
+    # ======================================================================
     # Sidebar
-    # ------------------------------------------------------------------
+    # ======================================================================
 
     def _build_sidebar(self):
 
@@ -765,30 +785,30 @@ class NovaGUI:
             pady=(0, 10),
         )
 
-        list_container = tk.Frame(
+        container = tk.Frame(
             self.sidebar,
             bg=self.SIDEBAR_BG,
         )
 
-        list_container.grid(
+        container.grid(
             row=2,
             column=0,
             sticky="nsew",
             padx=8,
         )
 
-        list_container.grid_rowconfigure(
+        container.grid_rowconfigure(
             0,
             weight=1,
         )
 
-        list_container.grid_columnconfigure(
+        container.grid_columnconfigure(
             0,
             weight=1,
         )
 
         self.chat_canvas = tk.Canvas(
-            list_container,
+            container,
             bg=self.SIDEBAR_BG,
             highlightthickness=0,
         )
@@ -800,7 +820,7 @@ class NovaGUI:
         )
 
         scrollbar = ttk.Scrollbar(
-            list_container,
+            container,
             orient="vertical",
             command=self.chat_canvas.yview,
         )
@@ -830,7 +850,7 @@ class NovaGUI:
         self.chat_list_frame.bind(
             "<Configure>",
             lambda event: self.chat_canvas.configure(
-                scrollregion=self.chat_canvas.bbox("all")
+                scrollregion=self.chat_canvas.bbox("all"),
             ),
         )
 
@@ -849,9 +869,9 @@ class NovaGUI:
             width=event.width,
         )
 
-    # ------------------------------------------------------------------
+    # ======================================================================
     # Conversation
-    # ------------------------------------------------------------------
+    # ======================================================================
 
     def _build_conversation(self):
 
@@ -919,7 +939,7 @@ class NovaGUI:
         self.message_frame.bind(
             "<Configure>",
             lambda event: self.conversation_canvas.configure(
-                scrollregion=self.conversation_canvas.bbox("all")
+                scrollregion=self.conversation_canvas.bbox("all"),
             ),
         )
 
@@ -938,9 +958,9 @@ class NovaGUI:
             width=event.width,
         )
 
-    # ------------------------------------------------------------------
-    # Input
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # Input area
+    # ======================================================================
 
     def _build_input(self):
 
@@ -1018,9 +1038,9 @@ class NovaGUI:
             self._handle_return,
         )
 
-    # ------------------------------------------------------------------
+    # ======================================================================
     # Chat list
-    # ------------------------------------------------------------------
+    # ======================================================================
 
     def load_chat_list(self):
 
@@ -1044,9 +1064,9 @@ class NovaGUI:
 
             self.root.after(
                 0,
-                lambda: self._show_error(
+                lambda error=exc: self._show_error(
                     "Could not load Nova chats.",
-                    exc,
+                    error,
                 ),
             )
 
@@ -1054,7 +1074,9 @@ class NovaGUI:
 
         self.root.after(
             0,
-            lambda: self._populate_chat_list(chats),
+            lambda items=chats: self._populate_chat_list(
+                items
+            ),
         )
 
     def _populate_chat_list(
@@ -1090,7 +1112,7 @@ class NovaGUI:
                 borderwidth=0,
                 padx=10,
                 pady=8,
-                command=lambda c=chat: self.open_chat(c),
+                command=lambda item=chat: self.open_chat(item),
             )
 
             button.pack(
@@ -1099,7 +1121,7 @@ class NovaGUI:
                 expand=True,
             )
 
-            delete = tk.Button(
+            delete_button = tk.Button(
                 row,
                 text="⋯",
                 font=("Segoe UI Semibold", 11),
@@ -1108,10 +1130,10 @@ class NovaGUI:
                 activebackground=self.ACTIVE_BG,
                 relief="flat",
                 borderwidth=0,
-                command=lambda c=chat: self.delete_chat(c),
+                command=lambda item=chat: self.delete_chat(item),
             )
 
-            delete.pack(
+            delete_button.pack(
                 side="right",
                 padx=(0, 4),
             )
@@ -1120,9 +1142,9 @@ class NovaGUI:
             text="Nova ready."
         )
 
-    # ------------------------------------------------------------------
-    # Create chat
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # New chat
+    # ======================================================================
 
     def create_chat(self):
 
@@ -1164,9 +1186,9 @@ class NovaGUI:
 
             self.root.after(
                 0,
-                lambda: self._show_error(
+                lambda error=exc: self._show_error(
                     "Could not create chat.",
-                    exc,
+                    error,
                 ),
             )
 
@@ -1174,7 +1196,9 @@ class NovaGUI:
 
         self.root.after(
             0,
-            lambda: self._chat_created(chat),
+            lambda item=chat: self._chat_created(
+                item
+            ),
         )
 
     def _chat_created(
@@ -1191,9 +1215,9 @@ class NovaGUI:
             [],
         )
 
-    # ------------------------------------------------------------------
+    # ======================================================================
     # Open chat
-    # ------------------------------------------------------------------
+    # ======================================================================
 
     def open_chat(
         self,
@@ -1208,15 +1232,13 @@ class NovaGUI:
 
         self._clear_messages()
 
-        loading = tk.Label(
+        tk.Label(
             self.message_frame,
             text="Loading conversation...",
             font=("Segoe UI", 11),
             fg=self.MUTED,
             bg=self.BG,
-        )
-
-        loading.pack(
+        ).pack(
             pady=60,
         )
 
@@ -1242,9 +1264,9 @@ class NovaGUI:
 
             self.root.after(
                 0,
-                lambda: self._show_error(
+                lambda error=exc: self._show_error(
                     "This chat could not be loaded.",
-                    exc,
+                    error,
                 ),
             )
 
@@ -1252,9 +1274,9 @@ class NovaGUI:
 
         self.root.after(
             0,
-            lambda: self._render_chat(
-                chat,
-                messages,
+            lambda item=chat, history=messages: self._render_chat(
+                item,
+                history,
             ),
         )
 
@@ -1266,22 +1288,21 @@ class NovaGUI:
 
         self._clear_messages()
 
-        title = tk.Label(
+        tk.Label(
             self.message_frame,
             text=chat.name,
             font=("Segoe UI Semibold", 16),
             fg=self.TEXT,
             bg=self.BG,
             anchor="w",
-        )
-
-        title.pack(
+        ).pack(
             fill="x",
             padx=40,
             pady=(28, 18),
         )
 
         for message in messages:
+
             self._display_message(
                 message.role,
                 message.content,
@@ -1293,9 +1314,9 @@ class NovaGUI:
 
         self._scroll_bottom()
 
-    # ------------------------------------------------------------------
+    # ======================================================================
     # Delete chat
-    # ------------------------------------------------------------------
+    # ======================================================================
 
     def delete_chat(
         self,
@@ -1340,9 +1361,9 @@ class NovaGUI:
 
             self.root.after(
                 0,
-                lambda: self._show_error(
+                lambda error=exc: self._show_error(
                     "Could not delete chat.",
-                    exc,
+                    error,
                 ),
             )
 
@@ -1350,7 +1371,9 @@ class NovaGUI:
 
         self.root.after(
             0,
-            lambda: self._chat_deleted(chat),
+            lambda item=chat: self._chat_deleted(
+                item
+            ),
         )
 
     def _chat_deleted(
@@ -1360,8 +1383,7 @@ class NovaGUI:
 
         if (
             self.current_chat is not None
-            and self.current_chat.identifier
-            == chat.identifier
+            and self.current_chat.identifier == chat.identifier
         ):
             self.current_chat = None
             self.show_empty_state()
@@ -1372,9 +1394,9 @@ class NovaGUI:
 
         self.load_chat_list()
 
-    # ------------------------------------------------------------------
-    # Message display
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # Message rendering
+    # ======================================================================
 
     def _clear_messages(self):
 
@@ -1448,30 +1470,32 @@ class NovaGUI:
             pady=(0, 4),
         )
 
+        bubble_color = (
+            self.USER_BG
+            if is_user
+            else self.NOVA_BG
+        )
+
         bubble = tk.Frame(
             outer,
-            bg=self.USER_BG
-            if is_user
-            else self.NOVA_BG,
+            bg=bubble_color,
         )
 
         bubble.pack(
             fill="x",
         )
 
+        font = (
+            "Consolas"
+            if self._looks_like_code(content)
+            else "Segoe UI"
+        )
+
         text = tk.Text(
             bubble,
             wrap="word",
-            font=(
-                "Consolas"
-                if self._looks_like_code(content)
-                else "Segoe UI"
-            ),
-            bg=(
-                self.USER_BG
-                if is_user
-                else self.NOVA_BG
-            ),
+            font=font,
+            bg=bubble_color,
             fg=self.TEXT,
             relief="flat",
             borderwidth=0,
@@ -1517,16 +1541,19 @@ class NovaGUI:
             or "\n    " in text
         )
 
-    # ------------------------------------------------------------------
-    # Input handling
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # Input
+    # ======================================================================
 
     def _handle_return(
         self,
         event,
     ):
+        """
+        Enter = send.
+        Shift+Enter = newline.
+        """
 
-        # Shift+Enter = newline.
         if event.state & 0x0001:
             return None
 
@@ -1554,9 +1581,9 @@ class NovaGUI:
                 activebackground="#e5e5e8",
             )
 
-    # ------------------------------------------------------------------
-    # Send message
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # Send
+    # ======================================================================
 
     def send_message(self):
 
@@ -1629,8 +1656,11 @@ class NovaGUI:
 
         except Exception as primary_error:
 
-            # If the persistent-chat API is unavailable, use NovaRuntime
-            # directly rather than silently creating replacement storage.
+            # Temporary fallback while the exact concrete persistent-chat
+            # API is unknown.
+            #
+            # This still uses the existing NovaRuntime and DOES NOT create
+            # replacement storage.
             try:
 
                 result = self.backend.ask(
@@ -1642,9 +1672,9 @@ class NovaGUI:
 
                 self.root.after(
                     0,
-                    lambda: self._show_error(
+                    lambda error=fallback_error: self._show_error(
                         "Nova could not generate a response.",
-                        fallback_error,
+                        error,
                     ),
                 )
 
@@ -1655,18 +1685,15 @@ class NovaGUI:
 
                 return
 
-            # The fallback is intentionally not treated as persistent
-            # history. The actual Nova chat implementation will need to
-            # be used once its concrete API is known.
-
             print(
-                "[Nova GUI] Persistent chat API failed; "
-                "used runtime.ask()/think() fallback.",
+                "[Nova GUI] Persistent chat API unavailable; "
+                "used NovaRuntime.ask()/think() fallback.",
                 flush=True,
             )
 
             print(
-                f"[Nova GUI] Original error: {primary_error}",
+                f"[Nova GUI] Original persistent-chat error: "
+                f"{primary_error}",
                 flush=True,
             )
 
@@ -1676,7 +1703,9 @@ class NovaGUI:
 
         self.root.after(
             0,
-            lambda: self._receive_response(answer),
+            lambda response=answer: self._receive_response(
+                response
+            ),
         )
 
     @staticmethod
@@ -1720,9 +1749,9 @@ class NovaGUI:
 
         self._scroll_bottom()
 
-    # ------------------------------------------------------------------
-    # UX
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # Responsiveness
+    # ======================================================================
 
     def _set_generating(
         self,
@@ -1760,9 +1789,9 @@ class NovaGUI:
             ),
         )
 
-    # ------------------------------------------------------------------
-    # Errors
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # Error handling
+    # ======================================================================
 
     def _show_error(
         self,
@@ -1778,7 +1807,7 @@ class NovaGUI:
         traceback.print_exc()
 
         self.status_label.config(
-            text="Error"
+            text="Error",
         )
 
         messagebox.showerror(
@@ -1787,9 +1816,9 @@ class NovaGUI:
             parent=self.root,
         )
 
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # Application
+    # ======================================================================
 
     def run(self):
 
@@ -1797,7 +1826,7 @@ class NovaGUI:
 
 
 # ============================================================================
-# Nova plugin entry point
+# CLI callback
 # ============================================================================
 
 def run_ui(
@@ -1805,9 +1834,11 @@ def run_ui(
     runtime,
 ):
     """
-    CLI callback for:
+    Callback for:
 
         nova --ui
+
+    Nova owns command-line parsing. The plugin does not inspect sys.argv.
     """
 
     del args
@@ -1821,6 +1852,10 @@ def run_ui(
     return None
 
 
+# ============================================================================
+# Nova plugin
+# ============================================================================
+
 class GUIPlugin(NovaPlugin):
 
     name = PLUGIN_NAME
@@ -1832,6 +1867,9 @@ class GUIPlugin(NovaPlugin):
         self,
         nova,
     ):
+        """
+        Register the GUI command through Nova's plugin system.
+        """
 
         nova.register_cli_command(
             name="ui",
@@ -1842,7 +1880,7 @@ class GUIPlugin(NovaPlugin):
 
 
 # ============================================================================
-# Plugin export
+# Plugin export required by Nova loader
 # ============================================================================
 
 plugin = GUIPlugin()
