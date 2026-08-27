@@ -1,611 +1,351 @@
 """
-Nova GUI Plugin
-===============
+Nova GUI
+========
 
-Single-file graphical frontend for Nova.
+Single-file graphical frontend for Novatrix.
 
-Installation:
-    Copy this file to:
-
-        ~/.nova/plugins/gui/plugin.py
-
-Windows equivalent:
-
-        C:\\Users\\<username>\\.nova\\plugins\\gui\\plugin.py
+Install:
+    ~/.nova/plugins/gui/plugin.py
 
 Launch:
     nova --ui
 
-Architecture:
-    GUI
-      |
-      v
-    NovaRuntime
-      |
-      +-- existing Qwen model
-      +-- existing chat/memory system
-      +-- existing web functionality
-      +-- existing PDF functionality
-      +-- existing thinking functionality
+Design:
+    ChatGPT-inspired monochrome interface.
 
-IMPORTANT:
-    This plugin does not create another model, another memory database,
-    another web system, or another PDF implementation.
+Backend:
+    Uses the EXISTING Novatrix chat/model infrastructure.
 
-The concrete persistent-chat API is not explicitly defined by the
-Nova plugin specification, so the backend contains a small adapter
-which attempts to use the existing Nova chat API without creating
-replacement storage.
+No second:
+    - model
+    - chat database
+    - memory system
+    - web system
+    - PDF system
 """
 
 from __future__ import annotations
 
 import threading
-import traceback
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
-from typing import Any, Optional
+from tkinter import messagebox, simpledialog
+from typing import Any
 
-from plugin_system import NovaPlugin
+from novatrix.nova import (
+    nova,
+    read_pdf,
+    search_with_sources,
+)
+
+from novatrix.chats import (
+    chat_exists,
+    create_chat,
+    delete_chat,
+    list_chats,
+    open_chat,
+)
+
+from novatrix.pdf import parse_pdf_control
+from novatrix.web import parse_chat_controls
+from novatrix.plugin_system import NovaPlugin
 
 
 # ============================================================================
-# Plugin metadata
+# THEME
 # ============================================================================
 
-PLUGIN_NAME = "gui"
-PLUGIN_VERSION = "1.0.0"
-PLUGIN_API_VERSION = 1
+BG = "#000000"
+SIDEBAR = "#0a0a0a"
+SIDEBAR_HOVER = "#171717"
+SURFACE = "#121212"
+SURFACE_2 = "#181818"
+BORDER = "#252525"
+
+TEXT = "#f5f5f5"
+TEXT_SECONDARY = "#b3b3b3"
+TEXT_MUTED = "#737373"
+
+WHITE = "#ffffff"
+BLACK = "#000000"
+
+FONT = "Segoe UI"
+
+WINDOW_WIDTH = 1250
+WINDOW_HEIGHT = 780
 
 
 # ============================================================================
-# Small internal data classes
-#
-# These are deliberately ordinary Python classes rather than @dataclass.
-# Nova's current plugin loader dynamically imports modules without first
-# inserting them into sys.modules, which is incompatible with dataclasses
-# during decoration.
+# SMALL DATA OBJECTS
 # ============================================================================
 
 class ChatInfo:
+
     def __init__(
         self,
         name: str,
-        identifier: str,
+        messages: int = 0,
     ):
         self.name = name
-        self.identifier = identifier
-
-
-class ChatMessage:
-    def __init__(
-        self,
-        role: str,
-        content: str,
-    ):
-        self.role = role
-        self.content = content
+        self.messages = messages
 
 
 # ============================================================================
-# Nova backend adapter
+# NOVA BACKEND
 # ============================================================================
 
-class NovaGUIBackend:
+class NovaBackend:
     """
-    Thin adapter between the GUI and NovaRuntime.
+    Direct adapter around the real Novatrix APIs.
 
-    Model access:
-        Uses runtime.ask() and runtime.think().
-
-    Persistent chat access:
-        Attempts to locate the existing Nova chat manager.
-
-    The adapter intentionally never creates:
-        - gui_chats.json
-        - gui_memory.json
-        - gui_history.json
-        - a second Qwen/Llama model
+    This class intentionally does not create any alternate persistence layer.
     """
 
-    def __init__(
-        self,
-        runtime: Any,
-    ):
-        self.runtime = runtime
+    def __init__(self):
+        self.summary_interval = 10
 
     # ----------------------------------------------------------------------
-    # Existing Nova model
-    # ----------------------------------------------------------------------
-
-    def ask(
-        self,
-        message: str,
-        thinking: bool = False,
-    ) -> Any:
-        """
-        Ask the existing Nova runtime.
-
-        No model is instantiated here.
-        """
-        if thinking:
-            return self.runtime.think(message)
-
-        return self.runtime.ask(message)
-
-    # ----------------------------------------------------------------------
-    # Existing chat manager discovery
-    # ----------------------------------------------------------------------
-
-    def _find_chat_manager(self) -> Any:
-        """
-        Find an existing chat-management object exposed by Nova.
-
-        This is deliberately conservative. If no supported object exists,
-        the GUI reports the problem rather than creating replacement
-        persistent storage.
-        """
-
-        candidates = (
-            "chat",
-            "chats",
-            "chat_manager",
-            "memory",
-        )
-
-        for attribute_name in candidates:
-            manager = getattr(
-                self.runtime,
-                attribute_name,
-                None,
-            )
-
-            if manager is not None:
-                return manager
-
-        # Some implementations may expose a getter instead of a direct
-        # attribute.
-        getter_names = (
-            "get_chat_manager",
-            "get_chats",
-            "get_chat",
-        )
-
-        for getter_name in getter_names:
-            getter = getattr(
-                self.runtime,
-                getter_name,
-                None,
-            )
-
-            if not callable(getter):
-                continue
-
-            try:
-                manager = getter()
-
-            except TypeError:
-                # Getter probably expects an argument and therefore is
-                # not a manager getter.
-                continue
-
-            except Exception:
-                continue
-
-            if manager is not None:
-                return manager
-
-        raise RuntimeError(
-            "NovaRuntime does not expose a recognized existing chat API. "
-            "The GUI will not create a separate chat database."
-        )
-
-    @staticmethod
-    def _find_method(
-        obj: Any,
-        names: tuple[str, ...],
-    ):
-        """
-        Find the first callable attribute with one of the provided names.
-        """
-
-        for name in names:
-            method = getattr(
-                obj,
-                name,
-                None,
-            )
-
-            if callable(method):
-                return method
-
-        return None
-
-    # ----------------------------------------------------------------------
-    # List existing chats
+    # Chats
     # ----------------------------------------------------------------------
 
     def list_chats(self) -> list[ChatInfo]:
-        manager = self._find_chat_manager()
 
-        method = self._find_method(
-            manager,
-            (
-                "list_chats",
-                "get_chats",
-                "list",
-                "names",
-            ),
-        )
+        result = list_chats()
 
-        if method is None:
-            raise RuntimeError(
-                "Nova's chat manager does not expose a supported "
-                "chat-listing method."
+        output = []
+
+        for item in result:
+
+            output.append(
+                ChatInfo(
+                    name=item["name"],
+                    messages=item.get("messages", 0),
+                )
             )
 
-        result = method()
-
-        return self._normalize_chat_list(result)
-
-    # ----------------------------------------------------------------------
-    # Load existing chat
-    # ----------------------------------------------------------------------
-
-    def load_chat(
-        self,
-        identifier: str,
-    ) -> list[ChatMessage]:
-
-        manager = self._find_chat_manager()
-
-        method = self._find_method(
-            manager,
-            (
-                "load_chat",
-                "get_chat",
-                "open_chat",
-                "read_chat",
-                "history",
-                "get_history",
-            ),
-        )
-
-        if method is None:
-            raise RuntimeError(
-                "Nova's chat manager does not expose a supported "
-                "chat-loading method."
-            )
-
-        result = method(identifier)
-
-        return self._normalize_messages(result)
-
-    # ----------------------------------------------------------------------
-    # Create existing Nova chat
-    # ----------------------------------------------------------------------
+        return output
 
     def create_chat(
         self,
         name: str,
-    ) -> ChatInfo:
+    ):
 
-        manager = self._find_chat_manager()
-
-        method = self._find_method(
-            manager,
-            (
-                "create_chat",
-                "new_chat",
-                "create",
-                "new",
-            ),
+        return create_chat(
+            name,
+            summary_interval=self.summary_interval,
         )
 
-        if method is None:
-            raise RuntimeError(
-                "Nova's chat manager does not expose a supported "
-                "chat-creation method."
-            )
+    def open_chat(
+        self,
+        name: str,
+    ):
 
-        result = method(name)
-
-        return self._normalize_chat(
-            result,
-            fallback_name=name,
-        )
-
-    # ----------------------------------------------------------------------
-    # Delete existing Nova chat
-    # ----------------------------------------------------------------------
+        return open_chat(name)
 
     def delete_chat(
         self,
-        identifier: str,
-    ) -> None:
+        name: str,
+    ):
 
-        manager = self._find_chat_manager()
-
-        method = self._find_method(
-            manager,
-            (
-                "delete_chat",
-                "remove_chat",
-                "delete",
-                "remove",
-            ),
-        )
-
-        if method is None:
-            raise RuntimeError(
-                "Nova's chat manager does not expose a supported "
-                "chat-deletion method."
-            )
-
-        method(identifier)
+        return delete_chat(name)
 
     # ----------------------------------------------------------------------
-    # Send message through existing persistent chat system
+    # Normal local model response
     # ----------------------------------------------------------------------
 
     def send_message(
         self,
-        identifier: str,
+        chat_name: str,
         message: str,
-        thinking: bool,
-    ) -> Any:
+        thinking: bool = False,
+    ) -> str:
 
-        manager = self._find_chat_manager()
+        chat = open_chat(chat_name)
 
-        method = self._find_method(
-            manager,
-            (
-                "send_message",
-                "append_and_ask",
-                "ask",
-                "chat",
-                "send",
-            ),
-        )
+        if chat is None:
 
-        if method is None:
             raise RuntimeError(
-                "Nova's chat manager does not expose a supported "
-                "persistent message method."
+                f'Could not open chat "{chat_name}".'
             )
 
-        attempts = (
-            lambda: method(
-                identifier,
-                message,
-                thinking=thinking,
-            ),
-            lambda: method(
-                chat=identifier,
-                message=message,
-                thinking=thinking,
-            ),
-            lambda: method(
-                identifier,
-                message,
-                thinking,
-            ),
-            lambda: method(
-                identifier,
-                message,
-            ),
-        )
+        # --------------------------------------------------------------
+        # PDF
+        # --------------------------------------------------------------
 
-        last_error: Optional[Exception] = None
+        pdf_request = parse_pdf_control(message)
 
-        for attempt in attempts:
+        if pdf_request:
+
+            if not pdf_request["path"]:
+
+                return (
+                    "Usage: `@pdf file.pdf [question]`"
+                )
+
+            pdf_name = pdf_request["path"]
+
+            question = pdf_request["question"]
+
+            use_thinking = pdf_request["thinking"]
+
+            chat.add_pdf_action(
+                pdf_name,
+                question=question,
+                thinking=use_thinking,
+            )
+
             try:
-                return attempt()
 
-            except TypeError as exc:
-                last_error = exc
-                continue
-
-        raise RuntimeError(
-            "Nova's persistent chat message API does not match "
-            "the signatures supported by this GUI adapter."
-        ) from last_error
-
-    # ----------------------------------------------------------------------
-    # Normalize chat list
-    # ----------------------------------------------------------------------
-
-    @staticmethod
-    def _normalize_chat_list(
-        value: Any,
-    ) -> list[ChatInfo]:
-
-        if value is None:
-            return []
-
-        if isinstance(value, dict):
-            value = list(value.values())
-
-        if not isinstance(value, (list, tuple)):
-            raise RuntimeError(
-                "Nova returned an unsupported chat-list format."
-            )
-
-        result: list[ChatInfo] = []
-
-        for item in value:
-            result.append(
-                NovaGUIBackend._normalize_chat(item)
-            )
-
-        return result
-
-    # ----------------------------------------------------------------------
-    # Normalize chat object
-    # ----------------------------------------------------------------------
-
-    @staticmethod
-    def _normalize_chat(
-        item: Any,
-        fallback_name: Optional[str] = None,
-    ) -> ChatInfo:
-
-        if isinstance(item, ChatInfo):
-            return item
-
-        if isinstance(item, str):
-            return ChatInfo(
-                name=item,
-                identifier=item,
-            )
-
-        if isinstance(item, dict):
-
-            name = (
-                item.get("name")
-                or item.get("title")
-                or item.get("chat_name")
-                or fallback_name
-                or item.get("id")
-                or item.get("identifier")
-            )
-
-            identifier = (
-                item.get("id")
-                or item.get("identifier")
-                or item.get("chat_id")
-                or item.get("name")
-                or item.get("title")
-                or fallback_name
-            )
-
-            if name is None or identifier is None:
-                raise RuntimeError(
-                    "Nova returned a chat object without a usable "
-                    "name or identifier."
+                answer = read_pdf(
+                    pdf_name,
+                    prompt=question,
+                    think=use_thinking,
                 )
 
-            return ChatInfo(
-                name=str(name),
-                identifier=str(identifier),
-            )
+            except Exception as error:
 
-        name = (
-            getattr(item, "name", None)
-            or getattr(item, "title", None)
-            or fallback_name
-        )
-
-        identifier = (
-            getattr(item, "identifier", None)
-            or getattr(item, "id", None)
-            or getattr(item, "chat_id", None)
-            or name
-        )
-
-        if name is None or identifier is None:
-            raise RuntimeError(
-                "Nova returned an unsupported chat object."
-            )
-
-        return ChatInfo(
-            name=str(name),
-            identifier=str(identifier),
-        )
-
-    # ----------------------------------------------------------------------
-    # Normalize message history
-    # ----------------------------------------------------------------------
-
-    @staticmethod
-    def _normalize_messages(
-        value: Any,
-    ) -> list[ChatMessage]:
-
-        if value is None:
-            return []
-
-        if isinstance(value, dict):
-
-            for key in (
-                "messages",
-                "history",
-                "chat",
-                "conversation",
-            ):
-                if key in value:
-                    value = value[key]
-                    break
-
-        if not isinstance(value, (list, tuple)):
-            raise RuntimeError(
-                "Nova returned an unsupported message-history format."
-            )
-
-        result: list[ChatMessage] = []
-
-        for item in value:
-
-            if isinstance(item, ChatMessage):
-                result.append(item)
-                continue
-
-            if isinstance(item, dict):
-
-                role = (
-                    item.get("role")
-                    or item.get("speaker")
-                    or item.get("author")
-                    or "assistant"
+                answer = (
+                    f"Error reading PDF: {error}"
                 )
 
-                content = item.get("content")
+            chat.add_pdf_response(
+                answer,
+                pdf_name,
+                thinking=use_thinking,
+            )
 
-                if content is None:
-                    content = item.get("message")
+            self._maybe_summarize(chat)
 
-                if content is None:
-                    continue
+            return answer
 
-                result.append(
-                    ChatMessage(
-                        role=str(role),
-                        content=str(content),
+        # --------------------------------------------------------------
+        # WEB
+        # --------------------------------------------------------------
+
+        message, web_requested, use_thinking = (
+            parse_chat_controls(message)
+        )
+
+        if web_requested:
+
+            result = search_with_sources(
+                message,
+                think=use_thinking,
+            )
+
+            answer = result["answer"]
+
+            chat.add_web_search_action(
+                message,
+                sources=result["sources"],
+                thinking=use_thinking,
+            )
+
+            chat.add_web_search_response(
+                answer,
+                query=message,
+                sources=result["sources"],
+                thinking=use_thinking,
+            )
+
+            if result["sources"]:
+
+                answer += (
+                    "\n\n"
+                    "Sources:\n"
+                    +
+                    "\n".join(
+                        f"- {source['url']}"
+                        for source in result["sources"]
                     )
                 )
 
-                continue
+            self._maybe_summarize(chat)
 
-            role = getattr(
-                item,
-                "role",
-                "assistant",
+            return answer
+
+        # --------------------------------------------------------------
+        # THINKING MODE
+        # --------------------------------------------------------------
+
+        if message.strip().startswith("@think "):
+
+            use_thinking = True
+
+            message = (
+                message[7:]
+                .strip()
             )
 
-            content = getattr(
-                item,
-                "content",
-                None,
+        else:
+
+            use_thinking = thinking
+
+        # --------------------------------------------------------------
+        # NORMAL MESSAGE
+        # --------------------------------------------------------------
+
+        if use_thinking:
+
+            user_content = (
+                "/think\n"
+                +
+                message
             )
 
-            if content is None:
-                content = getattr(
-                    item,
-                    "message",
-                    None,
-                )
+        else:
 
-            if content is None:
-                continue
-
-            result.append(
-                ChatMessage(
-                    role=str(role),
-                    content=str(content),
-                )
+            user_content = (
+                "/no_think\n"
+                +
+                message
             )
 
-        return result
+        chat.add_user_message(
+            user_content,
+            action="local",
+            web_searched=False,
+            thinking=use_thinking,
+        )
+
+        context = chat.get_context_for_model()
+
+        response = nova.create_chat_completion(
+            messages=context,
+            max_tokens=500,
+        )
+
+        answer = (
+            response["choices"][0]["message"]["content"]
+        )
+
+        chat.add_assistant_message(
+            answer,
+            thinking=use_thinking,
+        )
+
+        self._maybe_summarize(chat)
+
+        return answer
+
+    # ----------------------------------------------------------------------
+    # Summary
+    # ----------------------------------------------------------------------
+
+    def _maybe_summarize(
+        self,
+        chat,
+    ):
+
+        try:
+
+            if chat.should_summarize():
+
+                chat.create_summary()
+
+        except Exception:
+
+            # Memory summarization should never crash the GUI.
+            pass
 
 
 # ============================================================================
@@ -614,33 +354,22 @@ class NovaGUIBackend:
 
 class NovaGUI:
 
-    WINDOW_TITLE = "Nova"
-    DEFAULT_GEOMETRY = "1200x760"
+    def __init__(self):
 
-    BG = "#f7f7f8"
-    SIDEBAR_BG = "#ededf0"
-    TEXT = "#202123"
-    MUTED = "#6f6f78"
-    USER_BG = "#ffffff"
-    NOVA_BG = "#eeeeF1"
-    ACTIVE_BG = "#ddddE2"
+        self.backend = NovaBackend()
 
-    def __init__(
-        self,
-        runtime: Any,
-    ):
+        self.current_chat: str | None = None
 
-        self.runtime = runtime
-        self.backend = NovaGUIBackend(runtime)
+        self.thinking = False
+
+        self.generating = False
 
         self.root = tk.Tk()
 
-        self.root.title(
-            self.WINDOW_TITLE
-        )
+        self.root.title("Nova")
 
         self.root.geometry(
-            self.DEFAULT_GEOMETRY
+            f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}"
         )
 
         self.root.minsize(
@@ -648,26 +377,51 @@ class NovaGUI:
             600,
         )
 
-        self.current_chat: Optional[ChatInfo] = None
-
-        self.thinking = False
-
-        self.generating = False
-
-        self._build_ui()
-
-    # ======================================================================
-    # UI setup
-    # ======================================================================
-
-    def _build_ui(self):
-
         self.root.configure(
-            bg=self.BG,
+            bg=BG,
         )
 
+        self._configure_fonts()
+
+        self._build_interface()
+
+        self._load_chats_async()
+
+    # ======================================================================
+    # Fonts
+    # ======================================================================
+
+    def _configure_fonts(self):
+
+        self.font_normal = (
+            FONT,
+            10,
+        )
+
+        self.font_message = (
+            FONT,
+            11,
+        )
+
+        self.font_small = (
+            FONT,
+            9,
+        )
+
+        self.font_title = (
+            FONT,
+            16,
+            "bold",
+        )
+
+    # ======================================================================
+    # Main layout
+    # ======================================================================
+
+    def _build_interface(self):
+
         self.root.grid_rowconfigure(
-            1,
+            0,
             weight=1,
         )
 
@@ -676,62 +430,9 @@ class NovaGUI:
             weight=1,
         )
 
-        self._build_header()
         self._build_sidebar()
-        self._build_conversation()
-        self._build_input()
 
-        self.show_empty_state()
-
-        self.root.after(
-            100,
-            self.load_chat_list,
-        )
-
-    # ======================================================================
-    # Header
-    # ======================================================================
-
-    def _build_header(self):
-
-        self.header = tk.Frame(
-            self.root,
-            bg=self.BG,
-            height=58,
-        )
-
-        self.header.grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-        )
-
-        self.header.grid_propagate(False)
-
-        tk.Label(
-            self.header,
-            text="Nova",
-            font=("Segoe UI Semibold", 17),
-            fg=self.TEXT,
-            bg=self.BG,
-        ).pack(
-            side="left",
-            padx=22,
-        )
-
-        self.status_label = tk.Label(
-            self.header,
-            text="Loading...",
-            font=("Segoe UI", 9),
-            fg=self.MUTED,
-            bg=self.BG,
-        )
-
-        self.status_label.pack(
-            side="right",
-            padx=22,
-        )
+        self._build_main()
 
     # ======================================================================
     # Sidebar
@@ -741,12 +442,12 @@ class NovaGUI:
 
         self.sidebar = tk.Frame(
             self.root,
+            bg=SIDEBAR,
             width=270,
-            bg=self.SIDEBAR_BG,
         )
 
         self.sidebar.grid(
-            row=1,
+            row=0,
             column=0,
             sticky="nsew",
         )
@@ -758,108 +459,174 @@ class NovaGUI:
             weight=1,
         )
 
-        tk.Label(
+        # --------------------------------------------------------------
+        # Nova logo
+        # --------------------------------------------------------------
+
+        logo = tk.Frame(
             self.sidebar,
-            text="Chats",
-            font=("Segoe UI Semibold", 13),
-            fg=self.TEXT,
-            bg=self.SIDEBAR_BG,
-            anchor="w",
-        ).grid(
+            bg=SIDEBAR,
+            height=65,
+        )
+
+        logo.grid(
             row=0,
             column=0,
             sticky="ew",
-            padx=16,
-            pady=(15, 8),
         )
 
-        ttk.Button(
+        logo.grid_propagate(False)
+
+        tk.Label(
+            logo,
+            text="N",
+            font=(
+                FONT,
+                19,
+                "bold",
+            ),
+            fg=TEXT,
+            bg=SIDEBAR,
+        ).pack(
+            side="left",
+            padx=(18, 7),
+            pady=15,
+        )
+
+        tk.Label(
+            logo,
+            text="Nova",
+            font=(
+                FONT,
+                15,
+                "bold",
+            ),
+            fg=TEXT,
+            bg=SIDEBAR,
+        ).pack(
+            side="left",
+            pady=15,
+        )
+
+        # --------------------------------------------------------------
+        # New chat
+        # --------------------------------------------------------------
+
+        new_chat = tk.Frame(
             self.sidebar,
-            text="+ New Chat",
-            command=self.create_chat,
-        ).grid(
+            bg=SIDEBAR,
+        )
+
+        new_chat.grid(
             row=1,
             column=0,
             sticky="ew",
-            padx=12,
-            pady=(0, 10),
+            padx=10,
+            pady=(2, 10),
         )
 
-        container = tk.Frame(
-            self.sidebar,
-            bg=self.SIDEBAR_BG,
+        self.new_chat_button = self._button(
+            new_chat,
+            "＋  New chat",
+            self.create_chat,
+            bg=SIDEBAR,
+            hover=SIDEBAR_HOVER,
+            anchor="w",
+            padx=13,
+            pady=11,
         )
 
-        container.grid(
-            row=2,
-            column=0,
-            sticky="nsew",
-            padx=8,
+        self.new_chat_button.pack(
+            fill="x",
         )
 
-        container.grid_rowconfigure(
-            0,
-            weight=1,
-        )
-
-        container.grid_columnconfigure(
-            0,
-            weight=1,
-        )
+        # --------------------------------------------------------------
+        # Chat list
+        # --------------------------------------------------------------
 
         self.chat_canvas = tk.Canvas(
-            container,
-            bg=self.SIDEBAR_BG,
+            self.sidebar,
+            bg=SIDEBAR,
             highlightthickness=0,
+            borderwidth=0,
         )
 
         self.chat_canvas.grid(
-            row=0,
+            row=2,
             column=0,
             sticky="nsew",
+            padx=7,
         )
 
-        scrollbar = ttk.Scrollbar(
-            container,
-            orient="vertical",
-            command=self.chat_canvas.yview,
-        )
-
-        scrollbar.grid(
-            row=0,
-            column=1,
-            sticky="ns",
-        )
-
-        self.chat_canvas.configure(
-            yscrollcommand=scrollbar.set,
-        )
-
-        self.chat_list_frame = tk.Frame(
+        self.chat_frame = tk.Frame(
             self.chat_canvas,
-            bg=self.SIDEBAR_BG,
+            bg=SIDEBAR,
         )
 
-        self.chat_window = self.chat_canvas.create_window(
-            0,
-            0,
-            anchor="nw",
-            window=self.chat_list_frame,
+        self.chat_window = (
+            self.chat_canvas.create_window(
+                0,
+                0,
+                anchor="nw",
+                window=self.chat_frame,
+            )
         )
 
-        self.chat_list_frame.bind(
+        self.chat_frame.bind(
             "<Configure>",
             lambda event: self.chat_canvas.configure(
-                scrollregion=self.chat_canvas.bbox("all"),
+                scrollregion=(
+                    self.chat_canvas.bbox("all")
+                )
             ),
         )
 
         self.chat_canvas.bind(
             "<Configure>",
-            self._resize_sidebar_content,
+            self._resize_chat_frame,
         )
 
-    def _resize_sidebar_content(
+        self.chat_canvas.bind_all(
+            "<MouseWheel>",
+            self._mousewheel,
+            add="+",
+        )
+
+        # --------------------------------------------------------------
+        # Bottom sidebar
+        # --------------------------------------------------------------
+
+        bottom = tk.Frame(
+            self.sidebar,
+            bg=SIDEBAR,
+            height=55,
+        )
+
+        bottom.grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            padx=10,
+            pady=8,
+        )
+
+        bottom.grid_propagate(False)
+
+        tk.Label(
+            bottom,
+            text="Local Nova",
+            font=(
+                FONT,
+                9,
+            ),
+            fg=TEXT_MUTED,
+            bg=SIDEBAR,
+        ).pack(
+            side="left",
+            padx=7,
+        )
+
+    def _resize_chat_frame(
         self,
         event,
     ):
@@ -869,25 +636,41 @@ class NovaGUI:
             width=event.width,
         )
 
+    def _mousewheel(
+        self,
+        event,
+    ):
+
+        try:
+
+            self.chat_canvas.yview_scroll(
+                int(-event.delta / 120),
+                "units",
+            )
+
+        except Exception:
+
+            pass
+
     # ======================================================================
-    # Conversation
+    # Main window
     # ======================================================================
 
-    def _build_conversation(self):
+    def _build_main(self):
 
         self.main = tk.Frame(
             self.root,
-            bg=self.BG,
+            bg=BG,
         )
 
         self.main.grid(
-            row=1,
+            row=0,
             column=1,
             sticky="nsew",
         )
 
         self.main.grid_rowconfigure(
-            0,
+            1,
             weight=1,
         )
 
@@ -896,10 +679,98 @@ class NovaGUI:
             weight=1,
         )
 
-        self.conversation_canvas = tk.Canvas(
+        self._build_topbar()
+
+        self._build_conversation()
+
+        self._build_input()
+
+    # ======================================================================
+    # Top bar
+    # ======================================================================
+
+    def _build_topbar(self):
+
+        self.topbar = tk.Frame(
             self.main,
-            bg=self.BG,
+            bg=BG,
+            height=62,
+        )
+
+        self.topbar.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+        )
+
+        self.topbar.grid_propagate(False)
+
+        self.chat_title = tk.Label(
+            self.topbar,
+            text="Nova",
+            font=(
+                FONT,
+                15,
+                "bold",
+            ),
+            fg=TEXT,
+            bg=BG,
+        )
+
+        self.chat_title.pack(
+            side="left",
+            padx=24,
+            pady=18,
+        )
+
+        self.status = tk.Label(
+            self.topbar,
+            text="",
+            font=(
+                FONT,
+                9,
+            ),
+            fg=TEXT_MUTED,
+            bg=BG,
+        )
+
+        self.status.pack(
+            side="right",
+            padx=24,
+        )
+
+    # ======================================================================
+    # Conversation
+    # ======================================================================
+
+    def _build_conversation(self):
+
+        outer = tk.Frame(
+            self.main,
+            bg=BG,
+        )
+
+        outer.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+        )
+
+        outer.grid_rowconfigure(
+            0,
+            weight=1,
+        )
+
+        outer.grid_columnconfigure(
+            0,
+            weight=1,
+        )
+
+        self.conversation_canvas = tk.Canvas(
+            outer,
+            bg=BG,
             highlightthickness=0,
+            borderwidth=0,
         )
 
         self.conversation_canvas.grid(
@@ -908,47 +779,35 @@ class NovaGUI:
             sticky="nsew",
         )
 
-        scrollbar = ttk.Scrollbar(
-            self.main,
-            orient="vertical",
-            command=self.conversation_canvas.yview,
-        )
-
-        scrollbar.grid(
-            row=0,
-            column=1,
-            sticky="ns",
-        )
-
-        self.conversation_canvas.configure(
-            yscrollcommand=scrollbar.set,
-        )
-
         self.message_frame = tk.Frame(
             self.conversation_canvas,
-            bg=self.BG,
+            bg=BG,
         )
 
-        self.message_window = self.conversation_canvas.create_window(
-            0,
-            0,
-            anchor="nw",
-            window=self.message_frame,
+        self.message_window = (
+            self.conversation_canvas.create_window(
+                0,
+                0,
+                anchor="nw",
+                window=self.message_frame,
+            )
         )
 
         self.message_frame.bind(
             "<Configure>",
             lambda event: self.conversation_canvas.configure(
-                scrollregion=self.conversation_canvas.bbox("all"),
+                scrollregion=(
+                    self.conversation_canvas.bbox("all")
+                )
             ),
         )
 
         self.conversation_canvas.bind(
             "<Configure>",
-            self._resize_message_content,
+            self._resize_message_frame,
         )
 
-    def _resize_message_content(
+    def _resize_message_frame(
         self,
         event,
     ):
@@ -959,78 +818,103 @@ class NovaGUI:
         )
 
     # ======================================================================
-    # Input area
+    # Input
     # ======================================================================
 
     def _build_input(self):
 
-        self.input_area = tk.Frame(
+        area = tk.Frame(
             self.main,
-            bg=self.BG,
+            bg=BG,
         )
 
-        self.input_area.grid(
-            row=1,
+        area.grid(
+            row=2,
             column=0,
-            columnspan=2,
             sticky="ew",
-            padx=18,
-            pady=14,
+            padx=24,
+            pady=(8, 22),
         )
 
-        self.input_area.grid_columnconfigure(
-            0,
+        area.grid_columnconfigure(
+            1,
             weight=1,
         )
 
+        # --------------------------------------------------------------
+        # Input container
+        # --------------------------------------------------------------
+
+        self.input_container = tk.Frame(
+            area,
+            bg=SURFACE,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+
+        self.input_container.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+        )
+
+        self.input_container.grid_columnconfigure(
+            1,
+            weight=1,
+        )
+
+        # --------------------------------------------------------------
+        # Plus button
+        # --------------------------------------------------------------
+
+        self.plus_button = self._button(
+            self.input_container,
+            "+",
+            self.show_actions,
+            bg=SURFACE,
+            hover=SURFACE_2,
+            fg=TEXT_SECONDARY,
+            font=(
+                FONT,
+                17,
+            ),
+            width=3,
+            pady=8,
+        )
+
+        self.plus_button.grid(
+            row=0,
+            column=0,
+            padx=(8, 2),
+            pady=8,
+        )
+
+        # --------------------------------------------------------------
+        # Text box
+        # --------------------------------------------------------------
+
         self.input_box = tk.Text(
-            self.input_area,
-            height=4,
+            self.input_container,
+            height=3,
             wrap="word",
-            font=("Segoe UI", 11),
-            bg="#ffffff",
-            fg=self.TEXT,
-            insertbackground=self.TEXT,
-            relief="solid",
-            borderwidth=1,
+            font=self.font_message,
+            bg=SURFACE,
+            fg=TEXT,
+            insertbackground=TEXT,
+            selectbackground="#333333",
+            selectforeground=TEXT,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            padx=6,
+            pady=9,
         )
 
         self.input_box.grid(
             row=0,
-            column=0,
-            sticky="ew",
-        )
-
-        self.thinking_button = tk.Button(
-            self.input_area,
-            text="🧠 OFF",
-            command=self.toggle_thinking,
-            font=("Segoe UI Semibold", 10),
-            bg=self.BG,
-            fg=self.TEXT,
-            relief="flat",
-            borderwidth=0,
-            padx=12,
-            pady=8,
-        )
-
-        self.thinking_button.grid(
-            row=0,
             column=1,
-            padx=(8, 6),
-            sticky="s",
-        )
-
-        self.send_button = ttk.Button(
-            self.input_area,
-            text="Send",
-            command=self.send_message,
-        )
-
-        self.send_button.grid(
-            row=0,
-            column=2,
-            sticky="s",
+            sticky="ew",
+            pady=7,
         )
 
         self.input_box.bind(
@@ -1038,403 +922,195 @@ class NovaGUI:
             self._handle_return,
         )
 
-    # ======================================================================
-    # Chat list
-    # ======================================================================
+        # --------------------------------------------------------------
+        # Thinking
+        # --------------------------------------------------------------
 
-    def load_chat_list(self):
-
-        self.status_label.config(
-            text="Loading chats..."
-        )
-
-        thread = threading.Thread(
-            target=self._load_chat_list_worker,
-            daemon=True,
-        )
-
-        thread.start()
-
-    def _load_chat_list_worker(self):
-
-        try:
-            chats = self.backend.list_chats()
-
-        except Exception as exc:
-
-            self.root.after(
-                0,
-                lambda error=exc: self._show_error(
-                    "Could not load Nova chats.",
-                    error,
-                ),
-            )
-
-            return
-
-        self.root.after(
-            0,
-            lambda items=chats: self._populate_chat_list(
-                items
+        self.thinking_button = self._button(
+            self.input_container,
+            "Think",
+            self.toggle_thinking,
+            bg=SURFACE,
+            hover=SURFACE_2,
+            fg=TEXT_SECONDARY,
+            font=(
+                FONT,
+                9,
             ),
+            pady=7,
         )
 
-    def _populate_chat_list(
-        self,
-        chats: list[ChatInfo],
-    ):
-
-        for widget in self.chat_list_frame.winfo_children():
-            widget.destroy()
-
-        for chat in chats:
-
-            row = tk.Frame(
-                self.chat_list_frame,
-                bg=self.SIDEBAR_BG,
-            )
-
-            row.pack(
-                fill="x",
-                padx=2,
-                pady=2,
-            )
-
-            button = tk.Button(
-                row,
-                text=chat.name,
-                anchor="w",
-                font=("Segoe UI", 10),
-                fg=self.TEXT,
-                bg=self.SIDEBAR_BG,
-                activebackground=self.ACTIVE_BG,
-                relief="flat",
-                borderwidth=0,
-                padx=10,
-                pady=8,
-                command=lambda item=chat: self.open_chat(item),
-            )
-
-            button.pack(
-                side="left",
-                fill="x",
-                expand=True,
-            )
-
-            delete_button = tk.Button(
-                row,
-                text="⋯",
-                font=("Segoe UI Semibold", 11),
-                fg=self.MUTED,
-                bg=self.SIDEBAR_BG,
-                activebackground=self.ACTIVE_BG,
-                relief="flat",
-                borderwidth=0,
-                command=lambda item=chat: self.delete_chat(item),
-            )
-
-            delete_button.pack(
-                side="right",
-                padx=(0, 4),
-            )
-
-        self.status_label.config(
-            text="Nova ready."
+        self.thinking_button.grid(
+            row=0,
+            column=2,
+            padx=3,
+            pady=8,
         )
 
-    # ======================================================================
-    # New chat
-    # ======================================================================
+        # --------------------------------------------------------------
+        # Send
+        # --------------------------------------------------------------
 
-    def create_chat(self):
-
-        name = simpledialog.askstring(
-            "New Chat",
-            "Chat name:",
-            parent=self.root,
-        )
-
-        if name is None:
-            return
-
-        name = name.strip()
-
-        if not name:
-            return
-
-        self.status_label.config(
-            text="Creating chat..."
-        )
-
-        thread = threading.Thread(
-            target=self._create_chat_worker,
-            args=(name,),
-            daemon=True,
-        )
-
-        thread.start()
-
-    def _create_chat_worker(
-        self,
-        name: str,
-    ):
-
-        try:
-            chat = self.backend.create_chat(name)
-
-        except Exception as exc:
-
-            self.root.after(
-                0,
-                lambda error=exc: self._show_error(
-                    "Could not create chat.",
-                    error,
-                ),
-            )
-
-            return
-
-        self.root.after(
-            0,
-            lambda item=chat: self._chat_created(
-                item
+        self.send_button = self._button(
+            self.input_container,
+            "↑",
+            self.send_message,
+            bg=WHITE,
+            hover="#dcdcdc",
+            fg=BLACK,
+            font=(
+                FONT,
+                16,
+                "bold",
             ),
+            width=3,
+            pady=5,
         )
 
-    def _chat_created(
-        self,
-        chat: ChatInfo,
-    ):
-
-        self.current_chat = chat
-
-        self._refresh_chat_list()
-
-        self._render_chat(
-            chat,
-            [],
+        self.send_button.grid(
+            row=0,
+            column=3,
+            padx=(3, 8),
+            pady=8,
         )
 
-    # ======================================================================
-    # Open chat
-    # ======================================================================
-
-    def open_chat(
-        self,
-        chat: ChatInfo,
-    ):
-
-        self.current_chat = chat
-
-        self.status_label.config(
-            text=f"Opening {chat.name}..."
-        )
-
-        self._clear_messages()
+        # --------------------------------------------------------------
+        # Disclaimer
+        # --------------------------------------------------------------
 
         tk.Label(
-            self.message_frame,
-            text="Loading conversation...",
-            font=("Segoe UI", 11),
-            fg=self.MUTED,
-            bg=self.BG,
-        ).pack(
-            pady=60,
+            area,
+            text="Nova can make mistakes. Check important information.",
+            font=(
+                FONT,
+                8,
+            ),
+            fg=TEXT_MUTED,
+            bg=BG,
+        ).grid(
+            row=1,
+            column=1,
+            pady=(6, 0),
         )
 
-        thread = threading.Thread(
-            target=self._load_chat_worker,
-            args=(chat,),
-            daemon=True,
-        )
+    # ======================================================================
+    # Button helper
+    # ======================================================================
 
-        thread.start()
-
-    def _load_chat_worker(
+    def _button(
         self,
-        chat: ChatInfo,
+        parent,
+        text,
+        command,
+        bg=SURFACE,
+        hover=SURFACE_2,
+        fg=TEXT,
+        font=None,
+        width=None,
+        padx=10,
+        pady=7,
+        anchor="center",
     ):
 
-        try:
-            messages = self.backend.load_chat(
-                chat.identifier
-            )
+        kwargs = {
+            "text": text,
+            "command": command,
+            "bg": bg,
+            "fg": fg,
+            "activebackground": hover,
+            "activeforeground": fg,
+            "relief": "flat",
+            "borderwidth": 0,
+            "highlightthickness": 0,
+            "font": font or self.font_normal,
+            "padx": padx,
+            "pady": pady,
+            "anchor": anchor,
+            "cursor": "hand2",
+        }
 
-        except Exception as exc:
+        if width is not None:
+            kwargs["width"] = width
 
-            self.root.after(
-                0,
-                lambda error=exc: self._show_error(
-                    "This chat could not be loaded.",
-                    error,
-                ),
-            )
+        button = tk.Button(
+            parent,
+            **kwargs,
+        )
 
-            return
-
-        self.root.after(
-            0,
-            lambda item=chat, history=messages: self._render_chat(
-                item,
-                history,
+        button.bind(
+            "<Enter>",
+            lambda event: button.configure(
+                bg=hover
             ),
         )
 
-    def _render_chat(
-        self,
-        chat: ChatInfo,
-        messages: list[ChatMessage],
-    ):
-
-        self._clear_messages()
-
-        tk.Label(
-            self.message_frame,
-            text=chat.name,
-            font=("Segoe UI Semibold", 16),
-            fg=self.TEXT,
-            bg=self.BG,
-            anchor="w",
-        ).pack(
-            fill="x",
-            padx=40,
-            pady=(28, 18),
-        )
-
-        for message in messages:
-
-            self._display_message(
-                message.role,
-                message.content,
-            )
-
-        self.status_label.config(
-            text="Nova ready."
-        )
-
-        self._scroll_bottom()
-
-    # ======================================================================
-    # Delete chat
-    # ======================================================================
-
-    def delete_chat(
-        self,
-        chat: ChatInfo,
-    ):
-
-        confirmed = messagebox.askyesno(
-            "Delete Chat",
-            (
-                f'Delete chat "{chat.name}"?\n\n'
-                "This will permanently delete its memory."
-            ),
-            parent=self.root,
-        )
-
-        if not confirmed:
-            return
-
-        self.status_label.config(
-            text="Deleting chat..."
-        )
-
-        thread = threading.Thread(
-            target=self._delete_chat_worker,
-            args=(chat,),
-            daemon=True,
-        )
-
-        thread.start()
-
-    def _delete_chat_worker(
-        self,
-        chat: ChatInfo,
-    ):
-
-        try:
-            self.backend.delete_chat(
-                chat.identifier
-            )
-
-        except Exception as exc:
-
-            self.root.after(
-                0,
-                lambda error=exc: self._show_error(
-                    "Could not delete chat.",
-                    error,
-                ),
-            )
-
-            return
-
-        self.root.after(
-            0,
-            lambda item=chat: self._chat_deleted(
-                item
+        button.bind(
+            "<Leave>",
+            lambda event: button.configure(
+                bg=bg
             ),
         )
 
-    def _chat_deleted(
-        self,
-        chat: ChatInfo,
-    ):
-
-        if (
-            self.current_chat is not None
-            and self.current_chat.identifier == chat.identifier
-        ):
-            self.current_chat = None
-            self.show_empty_state()
-
-        self._refresh_chat_list()
-
-    def _refresh_chat_list(self):
-
-        self.load_chat_list()
+        return button
 
     # ======================================================================
-    # Message rendering
+    # Empty screen
     # ======================================================================
-
-    def _clear_messages(self):
-
-        for widget in self.message_frame.winfo_children():
-            widget.destroy()
 
     def show_empty_state(self):
 
         self._clear_messages()
 
-        frame = tk.Frame(
+        container = tk.Frame(
             self.message_frame,
-            bg=self.BG,
+            bg=BG,
         )
 
-        frame.pack(
+        container.pack(
             expand=True,
             fill="both",
-            pady=130,
+            pady=150,
         )
 
         tk.Label(
-            frame,
-            text="Nova",
-            font=("Segoe UI Semibold", 25),
-            fg=self.TEXT,
-            bg=self.BG,
-        ).pack(
-            pady=(0, 8),
-        )
-
-        tk.Label(
-            frame,
-            text="Select a chat or create a new one.",
-            font=("Segoe UI", 11),
-            fg=self.MUTED,
-            bg=self.BG,
+            container,
+            text="N",
+            font=(
+                FONT,
+                38,
+                "bold",
+            ),
+            fg=TEXT,
+            bg=BG,
         ).pack()
+
+        tk.Label(
+            container,
+            text="How can I help?",
+            font=(
+                FONT,
+                24,
+            ),
+            fg=TEXT,
+            bg=BG,
+        ).pack(
+            pady=(8, 4),
+        )
+
+        tk.Label(
+            container,
+            text="Choose a conversation or start a new one.",
+            font=(
+                FONT,
+                10,
+            ),
+            fg=TEXT_MUTED,
+            bg=BG,
+        ).pack()
+
+    # ======================================================================
+    # Message rendering
+    # ======================================================================
 
     def _display_message(
         self,
@@ -1447,59 +1123,121 @@ class NovaGUI:
             "human",
         }
 
-        outer = tk.Frame(
+        row = tk.Frame(
             self.message_frame,
-            bg=self.BG,
+            bg=BG,
         )
 
-        outer.pack(
+        row.pack(
             fill="x",
-            padx=38,
-            pady=7,
+            padx=70,
+            pady=15,
+        )
+
+        row.grid_columnconfigure(
+            1,
+            weight=1,
+        )
+
+        # --------------------------------------------------------------
+        # Avatar
+        # --------------------------------------------------------------
+
+        avatar = tk.Frame(
+            row,
+            width=32,
+            height=32,
+            bg=(
+                WHITE
+                if is_user
+                else SURFACE_2
+            ),
+        )
+
+        avatar.grid(
+            row=0,
+            column=0,
+            sticky="n",
+            padx=(0, 15),
+        )
+
+        avatar.grid_propagate(False)
+
+        tk.Label(
+            avatar,
+            text=(
+                "Y"
+                if is_user
+                else "N"
+            ),
+            font=(
+                FONT,
+                10,
+                "bold",
+            ),
+            fg=(
+                BLACK
+                if is_user
+                else TEXT
+            ),
+            bg=(
+                WHITE
+                if is_user
+                else SURFACE_2
+            ),
+        ).place(
+            relx=0.5,
+            rely=0.5,
+            anchor="center",
+        )
+
+        # --------------------------------------------------------------
+        # Content
+        # --------------------------------------------------------------
+
+        content_frame = tk.Frame(
+            row,
+            bg=BG,
+        )
+
+        content_frame.grid(
+            row=0,
+            column=1,
+            sticky="ew",
         )
 
         tk.Label(
-            outer,
-            text="You" if is_user else "Nova",
-            font=("Segoe UI Semibold", 10),
-            fg=self.TEXT,
-            bg=self.BG,
+            content_frame,
+            text=(
+                "You"
+                if is_user
+                else "Nova"
+            ),
+            font=(
+                FONT,
+                10,
+                "bold",
+            ),
+            fg=TEXT,
+            bg=BG,
             anchor="w",
         ).pack(
             fill="x",
             pady=(0, 4),
         )
 
-        bubble_color = (
-            self.USER_BG
-            if is_user
-            else self.NOVA_BG
-        )
-
-        bubble = tk.Frame(
-            outer,
-            bg=bubble_color,
-        )
-
-        bubble.pack(
-            fill="x",
-        )
-
-        font = (
-            "Consolas"
-            if self._looks_like_code(content)
-            else "Segoe UI"
-        )
-
         text = tk.Text(
-            bubble,
+            content_frame,
             wrap="word",
-            font=font,
-            bg=bubble_color,
-            fg=self.TEXT,
+            font=self.font_message,
+            bg=BG,
+            fg=TEXT,
+            insertbackground=TEXT,
             relief="flat",
             borderwidth=0,
             highlightthickness=0,
+            padx=0,
+            pady=0,
         )
 
         text.insert(
@@ -1511,55 +1249,400 @@ class NovaGUI:
             state="disabled",
         )
 
-        line_count = content.count("\n") + 1
+        text.pack(
+            fill="x",
+        )
 
-        text.configure(
-            height=max(
-                2,
-                min(
-                    25,
-                    line_count,
+    # ======================================================================
+    # Clear
+    # ======================================================================
+
+    def _clear_messages(self):
+
+        for widget in self.message_frame.winfo_children():
+
+            widget.destroy()
+
+    # ======================================================================
+    # Chat list
+    # ======================================================================
+
+    def _load_chats_async(self):
+
+        self.status.config(
+            text="Loading..."
+        )
+
+        threading.Thread(
+            target=self._load_chats_worker,
+            daemon=True,
+        ).start()
+
+    def _load_chats_worker(self):
+
+        try:
+
+            chats = self.backend.list_chats()
+
+        except Exception as error:
+
+            self.root.after(
+                0,
+                lambda: self._error(
+                    "Could not load chats.",
+                    error,
                 ),
+            )
+
+            return
+
+        self.root.after(
+            0,
+            lambda: self._populate_chats(
+                chats
             ),
         )
 
-        text.pack(
-            fill="x",
-            padx=14,
-            pady=12,
-        )
-
-    @staticmethod
-    def _looks_like_code(
-        text: str,
-    ) -> bool:
-
-        stripped = text.strip()
-
-        return (
-            stripped.startswith("```")
-            or "\n    " in text
-        )
-
-    # ======================================================================
-    # Input
-    # ======================================================================
-
-    def _handle_return(
+    def _populate_chats(
         self,
-        event,
+        chats: list[ChatInfo],
     ):
-        """
-        Enter = send.
-        Shift+Enter = newline.
-        """
 
-        if event.state & 0x0001:
-            return None
+        for widget in self.chat_frame.winfo_children():
 
-        self.send_message()
+            widget.destroy()
 
-        return "break"
+        for chat in chats:
+
+            self._add_chat_button(
+                chat
+            )
+
+        self.status.config(
+            text=""
+        )
+
+    def _add_chat_button(
+        self,
+        chat: ChatInfo,
+    ):
+
+        row = tk.Frame(
+            self.chat_frame,
+            bg=SIDEBAR,
+        )
+
+        row.pack(
+            fill="x",
+            pady=1,
+        )
+
+        button = self._button(
+            row,
+            chat.name,
+            lambda name=chat.name: self.open_chat(name),
+            bg=SIDEBAR,
+            hover=SIDEBAR_HOVER,
+            fg=TEXT_SECONDARY,
+            font=(
+                FONT,
+                10,
+            ),
+            anchor="w",
+            padx=13,
+            pady=9,
+        )
+
+        button.pack(
+            side="left",
+            fill="x",
+            expand=True,
+        )
+
+        menu = self._button(
+            row,
+            "⋯",
+            lambda name=chat.name: self.chat_menu(name),
+            bg=SIDEBAR,
+            hover=SIDEBAR_HOVER,
+            fg=TEXT_MUTED,
+            font=(
+                FONT,
+                12,
+            ),
+            width=3,
+            pady=5,
+        )
+
+        menu.pack(
+            side="right",
+        )
+
+    # ======================================================================
+    # New chat
+    # ======================================================================
+
+    def create_chat(self):
+
+        name = simpledialog.askstring(
+            "New chat",
+            "Name this conversation:",
+            parent=self.root,
+        )
+
+        if name is None:
+            return
+
+        name = name.strip()
+
+        if not name:
+            return
+
+        if chat_exists(name):
+
+            messagebox.showwarning(
+                "Nova",
+                f'A chat named "{name}" already exists.',
+                parent=self.root,
+            )
+
+            return
+
+        try:
+
+            self.backend.create_chat(name)
+
+        except Exception as error:
+
+            self._error(
+                "Could not create chat.",
+                error,
+            )
+
+            return
+
+        self.current_chat = name
+
+        self.chat_title.config(
+            text=name,
+        )
+
+        self._load_chats_async()
+
+        self._clear_messages()
+
+    # ======================================================================
+    # Open chat
+    # ======================================================================
+
+    def open_chat(
+        self,
+        name: str,
+    ):
+
+        self.current_chat = name
+
+        self.chat_title.config(
+            text=name,
+        )
+
+        self._clear_messages()
+
+        loading = tk.Label(
+            self.message_frame,
+            text="Loading conversation...",
+            font=(
+                FONT,
+                10,
+            ),
+            fg=TEXT_MUTED,
+            bg=BG,
+        )
+
+        loading.pack(
+            pady=100,
+        )
+
+        threading.Thread(
+            target=self._open_chat_worker,
+            args=(name,),
+            daemon=True,
+        ).start()
+
+    def _open_chat_worker(
+        self,
+        name: str,
+    ):
+
+        try:
+
+            chat = self.backend.open_chat(
+                name
+            )
+
+            if chat is None:
+
+                raise RuntimeError(
+                    "Chat could not be opened."
+                )
+
+            messages = list(
+                chat.messages
+            )
+
+        except Exception as error:
+
+            self.root.after(
+                0,
+                lambda: self._error(
+                    "Could not open chat.",
+                    error,
+                ),
+            )
+
+            return
+
+        self.root.after(
+            0,
+            lambda: self._render_history(
+                messages
+            ),
+        )
+
+    def _render_history(
+        self,
+        messages,
+    ):
+
+        self._clear_messages()
+
+        if not messages:
+
+            tk.Label(
+                self.message_frame,
+                text="Start the conversation.",
+                font=(
+                    FONT,
+                    11,
+                ),
+                fg=TEXT_MUTED,
+                bg=BG,
+            ).pack(
+                pady=100,
+            )
+
+            return
+
+        for message in messages:
+
+            role = message.get(
+                "role",
+                "assistant",
+            )
+
+            content = message.get(
+                "content",
+                "",
+            )
+
+            if not content:
+                continue
+
+            self._display_message(
+                role,
+                content,
+            )
+
+        self._scroll_bottom()
+
+    # ======================================================================
+    # Chat menu
+    # ======================================================================
+
+    def chat_menu(
+        self,
+        name: str,
+    ):
+
+        menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=SURFACE,
+            fg=TEXT,
+            activebackground=SURFACE_2,
+            activeforeground=TEXT,
+            borderwidth=0,
+        )
+
+        menu.add_command(
+            label="Open",
+            command=lambda: self.open_chat(name),
+        )
+
+        menu.add_command(
+            label="Delete",
+            command=lambda: self.delete_chat(name),
+        )
+
+        try:
+
+            menu.tk_popup(
+                self.root.winfo_pointerx(),
+                self.root.winfo_pointery(),
+            )
+
+        finally:
+
+            menu.grab_release()
+
+    # ======================================================================
+    # Delete
+    # ======================================================================
+
+    def delete_chat(
+        self,
+        name: str,
+    ):
+
+        confirmed = messagebox.askyesno(
+            "Delete chat",
+            f'Delete "{name}" permanently?',
+            parent=self.root,
+        )
+
+        if not confirmed:
+            return
+
+        try:
+
+            self.backend.delete_chat(
+                name
+            )
+
+        except Exception as error:
+
+            self._error(
+                "Could not delete chat.",
+                error,
+            )
+
+            return
+
+        if self.current_chat == name:
+
+            self.current_chat = None
+
+            self.chat_title.config(
+                text="Nova",
+            )
+
+            self.show_empty_state()
+
+        self._load_chats_async()
+
+    # ======================================================================
+    # Thinking
+    # ======================================================================
 
     def toggle_thinking(self):
 
@@ -1568,21 +1651,53 @@ class NovaGUI:
         if self.thinking:
 
             self.thinking_button.config(
-                text="🧠 ON",
-                bg=self.ACTIVE_BG,
-                activebackground="#d2d2d6",
+                text="Think ✓",
+                fg=TEXT,
             )
 
         else:
 
             self.thinking_button.config(
-                text="🧠 OFF",
-                bg=self.BG,
-                activebackground="#e5e5e8",
+                text="Think",
+                fg=TEXT_SECONDARY,
             )
 
     # ======================================================================
-    # Send
+    # Actions
+    # ======================================================================
+
+    def show_actions(self):
+
+        messagebox.showinfo(
+            "Nova",
+            (
+                "Available controls:\n\n"
+                "@think <message>\n"
+                "@web <message>\n"
+                "@pdf file.pdf [question]"
+            ),
+            parent=self.root,
+        )
+
+    # ======================================================================
+    # Input handling
+    # ======================================================================
+
+    def _handle_return(
+        self,
+        event,
+    ):
+
+        # Shift + Enter = newline
+        if event.state & 0x0001:
+            return None
+
+        self.send_message()
+
+        return "break"
+
+    # ======================================================================
+    # Sending
     # ======================================================================
 
     def send_message(self):
@@ -1593,7 +1708,7 @@ class NovaGUI:
         if self.current_chat is None:
 
             messagebox.showinfo(
-                "No Chat Selected",
+                "Nova",
                 "Create or select a chat first.",
                 parent=self.root,
             )
@@ -1608,7 +1723,8 @@ class NovaGUI:
         if not message:
             return
 
-        chat = self.current_chat
+        chat_name = self.current_chat
+
         thinking = self.thinking
 
         self.input_box.delete(
@@ -1621,119 +1737,64 @@ class NovaGUI:
             message,
         )
 
+        self._scroll_bottom()
+
         self._set_generating(
             True
         )
 
-        thread = threading.Thread(
-            target=self._send_message_worker,
+        threading.Thread(
+            target=self._send_worker,
             args=(
-                chat.identifier,
+                chat_name,
                 message,
                 thinking,
             ),
             daemon=True,
-        )
+        ).start()
 
-        thread.start()
-
-        self._scroll_bottom()
-
-    def _send_message_worker(
+    def _send_worker(
         self,
-        identifier: str,
+        chat_name: str,
         message: str,
         thinking: bool,
     ):
 
         try:
 
-            result = self.backend.send_message(
-                identifier,
+            answer = self.backend.send_message(
+                chat_name,
                 message,
                 thinking,
             )
 
-        except Exception as primary_error:
+        except Exception as error:
 
-            # Temporary fallback while the exact concrete persistent-chat
-            # API is unknown.
-            #
-            # This still uses the existing NovaRuntime and DOES NOT create
-            # replacement storage.
-            try:
-
-                result = self.backend.ask(
-                    message,
-                    thinking=thinking,
-                )
-
-            except Exception as fallback_error:
-
-                self.root.after(
-                    0,
-                    lambda error=fallback_error: self._show_error(
-                        "Nova could not generate a response.",
-                        error,
-                    ),
-                )
-
-                self.root.after(
-                    0,
-                    lambda: self._set_generating(False),
-                )
-
-                return
-
-            print(
-                "[Nova GUI] Persistent chat API unavailable; "
-                "used NovaRuntime.ask()/think() fallback.",
-                flush=True,
+            self.root.after(
+                0,
+                lambda: self._error(
+                    "Nova could not generate a response.",
+                    error,
+                ),
             )
 
-            print(
-                f"[Nova GUI] Original persistent-chat error: "
-                f"{primary_error}",
-                flush=True,
+            self.root.after(
+                0,
+                lambda: self._set_generating(
+                    False
+                ),
             )
 
-        answer = self._extract_response(
-            result
-        )
+            return
 
         self.root.after(
             0,
-            lambda response=answer: self._receive_response(
-                response
+            lambda: self._receive_answer(
+                answer
             ),
         )
 
-    @staticmethod
-    def _extract_response(
-        result: Any,
-    ) -> str:
-
-        if isinstance(result, str):
-            return result
-
-        if isinstance(result, dict):
-
-            for key in (
-                "answer",
-                "response",
-                "content",
-                "message",
-                "text",
-            ):
-
-                value = result.get(key)
-
-                if value is not None:
-                    return str(value)
-
-        return str(result)
-
-    def _receive_response(
+    def _receive_answer(
         self,
         answer: str,
     ):
@@ -1749,75 +1810,79 @@ class NovaGUI:
 
         self._scroll_bottom()
 
+        self._load_chats_async()
+
     # ======================================================================
-    # Responsiveness
+    # Loading state
     # ======================================================================
 
     def _set_generating(
         self,
-        value: bool,
+        generating: bool,
     ):
 
-        self.generating = value
+        self.generating = generating
 
-        if value:
+        if generating:
 
-            self.status_label.config(
-                text="Generating..."
+            self.status.config(
+                text="Nova is thinking..."
             )
 
-            self.send_button.state(
-                ["disabled"]
+            self.send_button.config(
+                state="disabled",
+                bg="#444444",
+                fg="#111111",
             )
 
         else:
 
-            self.status_label.config(
-                text="Nova ready."
+            self.status.config(
+                text=""
             )
 
-            self.send_button.state(
-                ["!disabled"]
+            self.send_button.config(
+                state="normal",
+                bg=WHITE,
+                fg=BLACK,
             )
+
+    # ======================================================================
+    # Scroll
+    # ======================================================================
 
     def _scroll_bottom(self):
 
         self.root.after(
-            30,
+            40,
             lambda: self.conversation_canvas.yview_moveto(
                 1.0
             ),
         )
 
     # ======================================================================
-    # Error handling
+    # Error
     # ======================================================================
 
-    def _show_error(
+    def _error(
         self,
         message: str,
-        exception: Exception,
+        error: Exception,
     ):
 
         print(
-            f"[Nova GUI] {message}",
+            f"[Nova GUI] {message}: {error}",
             flush=True,
-        )
-
-        traceback.print_exc()
-
-        self.status_label.config(
-            text="Error",
         )
 
         messagebox.showerror(
             "Nova",
-            message,
+            f"{message}\n\n{error}",
             parent=self.root,
         )
 
     # ======================================================================
-    # Application
+    # Run
     # ======================================================================
 
     def run(self):
@@ -1826,61 +1891,44 @@ class NovaGUI:
 
 
 # ============================================================================
-# CLI callback
-# ============================================================================
-
-def run_ui(
-    args,
-    runtime,
-):
-    """
-    Callback for:
-
-        nova --ui
-
-    Nova owns command-line parsing. The plugin does not inspect sys.argv.
-    """
-
-    del args
-
-    gui = NovaGUI(
-        runtime
-    )
-
-    gui.run()
-
-    return None
-
-
-# ============================================================================
-# Nova plugin
+# NOVA PLUGIN
 # ============================================================================
 
 class GUIPlugin(NovaPlugin):
 
-    name = PLUGIN_NAME
-    version = PLUGIN_VERSION
-    description = "Desktop graphical interface for Nova."
-    plugin_api_version = PLUGIN_API_VERSION
+    name = "gui"
+    version = "1.0.0"
+    description = "ChatGPT-inspired graphical interface for Nova."
+    plugin_api_version = 1
 
     def register(
         self,
-        nova,
+        nova_runtime,
     ):
-        """
-        Register the GUI command through Nova's plugin system.
-        """
 
-        nova.register_cli_command(
+        nova_runtime.register_cli_command(
             name="ui",
-            callback=run_ui,
+            callback=self.launch,
             help_text="Launch the Nova graphical interface.",
             action="store_true",
         )
 
+    def launch(
+        self,
+        args,
+        runtime,
+    ):
+
+        del args
+        del runtime
+
+        app = NovaGUI()
+
+        app.run()
+
 
 # ============================================================================
-# Plugin export required by Nova loader
+# REQUIRED PLUGIN EXPORT
 # ============================================================================
 
 plugin = GUIPlugin()
