@@ -6,34 +6,28 @@ Command:
 
     nova --cat
 
-A tiny animated desktop cat for Nova.
+Features:
+    - Uses the supplied cat.png artwork
+    - Gentle breathing animation
+    - Draggable around the desktop
+    - Resizable
+    - Red close button
+    - Double-click launches Nova GUI
+    - Always on top
 
-Controls
---------
-Left drag:
-    Move the cat.
+The plugin does NOT:
+    - create another model
+    - modify Nova memory
+    - modify Nova chat storage
+    - modify CPU priority
+    - modify other processes
+    - modify Windows settings
 
-Ctrl + left drag:
-    Resize the cat vertically.
+The cat image is loaded from:
 
-Mouse wheel:
-    Resize the cat.
+    cat.png
 
-Single click:
-    Show/hide the cat controls.
-
-Double click:
-    Launch Nova's GUI.
-
-Red X:
-    Remove the cat.
-
-The cat:
-    - stays on top
-    - breathes gently
-    - can be moved
-    - can be resized
-    - launches Nova GUI
+which must be located beside this plugin.py file.
 """
 
 from __future__ import annotations
@@ -44,7 +38,6 @@ import shutil
 import subprocess
 import sys
 import tkinter as tk
-
 
 from novatrix.plugin_system import NovaPlugin
 
@@ -60,12 +53,17 @@ MAX_SCALE = 4.0
 
 INITIAL_SCALE = 1.0
 
+# Breathing animation.
 BREATH_SPEED = 0.055
 BREATH_AMOUNT = 0.035
 
+# How frequently the animation updates.
+ANIMATION_INTERVAL_MS = 40
 
+# Size of the red close button relative to the cat.
 CONTROL_SIZE_RATIO = 0.26
 
+# Ctrl-drag resize sensitivity.
 RESIZE_SENSITIVITY = 0.008
 
 
@@ -79,10 +77,13 @@ def find_nova_command() -> list[str]:
 
     Prefer the `nova` executable.
 
-    Fall back to the current Python interpreter and the Nova module.
+    If it is not available on PATH, fall back to the current
+    Python interpreter and the Novatrix CLI module.
     """
 
-    executable = shutil.which("nova")
+    executable = shutil.which(
+        "nova"
+    )
 
     if executable:
 
@@ -103,7 +104,9 @@ def find_nova_command() -> list[str]:
 
 def launch_nova_ui() -> bool:
     """
-    Launch:
+    Launch Nova's existing graphical interface.
+
+    Equivalent to:
 
         nova --ui
     """
@@ -129,7 +132,7 @@ def launch_nova_ui() -> bool:
     except OSError as error:
 
         print(
-            f"[Nova Cat] Failed to launch Nova GUI: {error}",
+            f"[Nova Cat] Could not launch Nova GUI: {error}",
             file=sys.stderr,
             flush=True,
         )
@@ -147,9 +150,9 @@ class CatWindow:
 
         self.root = tk.Tk()
 
-        # --------------------------------------------------------------
-        # Borderless desktop window
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Borderless / always-on-top window
+        # ------------------------------------------------------------------
 
         self.root.overrideredirect(
             True
@@ -160,9 +163,9 @@ class CatWindow:
             True,
         )
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # State
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
 
         self.scale = INITIAL_SCALE
 
@@ -175,24 +178,17 @@ class CatWindow:
         self.controls_visible = False
 
         self.drag_start_x = 0
-
         self.drag_start_y = 0
 
         self.window_start_x = 0
-
         self.window_start_y = 0
 
         self.resize_start_y = 0
-
         self.resize_start_scale = INITIAL_SCALE
 
-        self.click_timer = None
-
-        self.last_click_time = 0
-
-        # --------------------------------------------------------------
-        # Image path
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Locate cat image
+        # ------------------------------------------------------------------
 
         self.image_path = self._find_image()
 
@@ -201,14 +197,13 @@ class CatWindow:
             self.root.destroy()
 
             raise RuntimeError(
-                "Nova Cat could not find cat.png."
-                "\n\n"
-                "Place cat.png beside the plugin's source file."
+                "Nova Cat could not find cat.png.\n\n"
+                "Make sure cat.png is beside plugin.py."
             )
 
-        # --------------------------------------------------------------
-        # Load image
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Load original image
+        # ------------------------------------------------------------------
 
         try:
 
@@ -221,7 +216,7 @@ class CatWindow:
             self.root.destroy()
 
             raise RuntimeError(
-                f"Could not load cat image:\n{error}"
+                f"Could not load cat.png:\n{error}"
             ) from error
 
         self.original_width = (
@@ -232,9 +227,9 @@ class CatWindow:
             self.original_image.height()
         )
 
-        # --------------------------------------------------------------
-        # Transparency
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Transparent window background
+        # ------------------------------------------------------------------
 
         self.transparent_color = "#00ff00"
 
@@ -251,15 +246,16 @@ class CatWindow:
 
         except tk.TclError:
 
+            # Fallback for systems where transparentcolor isn't available.
             self.transparent_color = "#000000"
 
             self.root.configure(
                 bg=self.transparent_color
             )
 
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Canvas
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
 
         self.canvas = tk.Canvas(
             self.root,
@@ -271,15 +267,17 @@ class CatWindow:
 
         self.canvas.pack()
 
-        # --------------------------------------------------------------
-        # Create initial cat
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Initial cat
+        # ------------------------------------------------------------------
 
-        self._rebuild_window()
+        self._rebuild_window(
+            first_build=True
+        )
 
-        # --------------------------------------------------------------
-        # Mouse events
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Mouse controls
+        # ------------------------------------------------------------------
 
         self.canvas.bind(
             "<ButtonPress-1>",
@@ -296,29 +294,45 @@ class CatWindow:
             self._mouse_up,
         )
 
+        # Single click:
+        # show/hide the controls.
+        self.canvas.bind(
+            "<Button-1>",
+            self._single_click,
+            add="+",
+        )
+
+        # Double click:
+        # launch Nova GUI.
         self.canvas.bind(
             "<Double-Button-1>",
             self._double_click,
         )
 
+        # Mouse wheel:
+        # resize cat.
         self.canvas.bind(
             "<MouseWheel>",
             self._mouse_wheel,
         )
 
+        # Right click:
+        # also show/hide controls.
         self.canvas.bind(
             "<Button-3>",
             self._right_click,
         )
 
+        # Escape:
+        # close the cat.
         self.root.bind(
             "<Escape>",
             self._close,
         )
 
-        # --------------------------------------------------------------
-        # Start animation
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Start breathing animation
+        # ------------------------------------------------------------------
 
         self._animate()
 
@@ -328,194 +342,45 @@ class CatWindow:
 
     def _find_image(self) -> str | None:
         """
-        Locate cat.png.
+        Find cat.png beside this plugin.py file.
 
-        First try beside this source file.
+        Current Nova installation structure:
 
-        Then try the current working directory.
+            ~/.nova/plugins/cat/
+                plugin.py
+                cat.png
         """
 
-        candidates = [
-            os.path.join(
-                os.path.dirname(
-                    os.path.abspath(__file__)
-                ),
-                CAT_IMAGE_NAME,
-            ),
-            os.path.join(
-                os.getcwd(),
-                CAT_IMAGE_NAME,
-            ),
-        ]
+        plugin_directory = os.path.dirname(
+            os.path.abspath(__file__)
+        )
 
-        for path in candidates:
+        path = os.path.join(
+            plugin_directory,
+            CAT_IMAGE_NAME,
+        )
 
-            if os.path.isfile(path):
+        if os.path.isfile(path):
 
-                return path
+            return path
+
+        # Development fallback:
+        # useful when running the source file directly.
+        current_directory_path = os.path.join(
+            os.getcwd(),
+            CAT_IMAGE_NAME,
+        )
+
+        if os.path.isfile(
+            current_directory_path
+        ):
+
+            return current_directory_path
 
         return None
 
     # ======================================================================
-    # RESIZING
-    # ======================================================================
-
-    def _calculate_size(self) -> tuple[int, int]:
-
-        breath = (
-            1.0
-            +
-            math.sin(
-                self.breath_phase
-            )
-            * BREATH_AMOUNT
-        )
-
-        effective_scale = (
-            self.scale
-            * breath
-        )
-
-        width = max(
-            1,
-            int(
-                self.original_width
-                * effective_scale
-            ),
-        )
-
-        height = max(
-            1,
-            int(
-                self.original_height
-                * effective_scale
-            ),
-        )
-
-        return width, height
-
-    def _rebuild_window(self):
-
-        width, height = self._calculate_size()
-
-        self.window_width = width
-
-        self.window_height = height
-
-        # --------------------------------------------------------------
-        # Resize image using PhotoImage zoom/subsample.
-        #
-        # Tkinter's native image scaling is integer-based, so we use
-        # a generated image through zoom/subsample when possible.
-        # --------------------------------------------------------------
-
-        self.current_image = self._scale_image(
-            width,
-            height,
-        )
-
-        self.canvas.configure(
-            width=width,
-            height=height,
-        )
-
-        self.canvas.delete(
-            "all"
-        )
-
-        self.image_id = self.canvas.create_image(
-            width // 2,
-            height // 2,
-            image=self.current_image,
-            anchor="center",
-        )
-
-        # --------------------------------------------------------------
-        # Position controls
-        # --------------------------------------------------------------
-
-        if self.controls_visible:
-
-            self._draw_controls()
-
-        # --------------------------------------------------------------
-        # Keep existing location when resizing.
-        # --------------------------------------------------------------
-
-        if not hasattr(
-            self,
-            "window_positioned",
-        ):
-
-            self._position_bottom_right()
-
-            self.window_positioned = True
-
-    def _scale_image(
-        self,
-        target_width: int,
-        target_height: int,
-    ):
-
-        """
-        Produce a PhotoImage scaled to the requested size.
-
-        Tk's PhotoImage has limited native scaling functionality,
-        so this function uses the closest stable integer scaling
-        available from the original image.
-
-        For the small pixel-art sprite this is intentional.
-        """
-
-        scale_x = (
-            target_width
-            /
-            self.original_width
-        )
-
-        scale_y = (
-            target_height
-            /
-            self.original_height
-        )
-
-        scale = min(
-            scale_x,
-            scale_y,
-        )
-
-        # Integer enlargement.
-        if scale >= 1:
-
-            factor = max(
-                1,
-                int(
-                    round(scale)
-                ),
-            )
-
-            return self.original_image.zoom(
-                factor,
-                factor,
-            )
-
-        # Integer reduction.
-        divisor = max(
-            1,
-            int(
-                round(
-                    1 / scale
-                )
-            ),
-        )
-
-        return self.original_image.subsample(
-            divisor,
-            divisor,
-        )
-
-    # ======================================================================
-    # POSITION
+    # INITIAL POSITION
     # ======================================================================
 
     def _position_bottom_right(self):
@@ -550,61 +415,261 @@ class CatWindow:
         )
 
     # ======================================================================
+    # CALCULATE BREATHING SIZE
+    # ======================================================================
+
+    def _calculate_size(
+        self,
+    ) -> tuple[int, int]:
+
+        breathing_factor = (
+            1.0
+            +
+            math.sin(
+                self.breath_phase
+            )
+            *
+            BREATH_AMOUNT
+        )
+
+        effective_scale = (
+            self.scale
+            *
+            breathing_factor
+        )
+
+        width = max(
+            1,
+            int(
+                self.original_width
+                *
+                effective_scale
+            ),
+        )
+
+        height = max(
+            1,
+            int(
+                self.original_height
+                *
+                effective_scale
+            ),
+        )
+
+        return (
+            width,
+            height,
+        )
+
+    # ======================================================================
+    # SCALE IMAGE
+    # ======================================================================
+
+    def _scale_image(
+        self,
+        target_width: int,
+        target_height: int,
+    ):
+        """
+        Scale the pixel artwork using Tkinter's native pixel-preserving
+        zoom/subsample operations.
+
+        No image processing or eye overlays happen here.
+
+        The PNG is simply the cat.
+        """
+
+        scale_x = (
+            target_width
+            /
+            self.original_width
+        )
+
+        scale_y = (
+            target_height
+            /
+            self.original_height
+        )
+
+        scale = min(
+            scale_x,
+            scale_y,
+        )
+
+        # --------------------------------------------------------------
+        # Enlarge
+        # --------------------------------------------------------------
+
+        if scale >= 1:
+
+            factor = max(
+                1,
+                int(
+                    round(scale)
+                ),
+            )
+
+            return self.original_image.zoom(
+                factor,
+                factor,
+            )
+
+        # --------------------------------------------------------------
+        # Shrink
+        # --------------------------------------------------------------
+
+        divisor = max(
+            1,
+            int(
+                round(
+                    1 / scale
+                )
+            ),
+        )
+
+        return self.original_image.subsample(
+            divisor,
+            divisor,
+        )
+
+    # ======================================================================
+    # REBUILD WINDOW
+    # ======================================================================
+
+    def _rebuild_window(
+        self,
+        first_build: bool = False,
+    ):
+
+        width, height = (
+            self._calculate_size()
+        )
+
+        self.window_width = width
+
+        self.window_height = height
+
+        # --------------------------------------------------------------
+        # Replace image
+        # --------------------------------------------------------------
+
+        self.current_image = (
+            self._scale_image(
+                width,
+                height,
+            )
+        )
+
+        self.canvas.configure(
+            width=width,
+            height=height,
+        )
+
+        self.canvas.delete(
+            "all"
+        )
+
+        self.canvas.create_image(
+            width // 2,
+            height // 2,
+            image=self.current_image,
+            anchor="center",
+        )
+
+        # --------------------------------------------------------------
+        # Draw optional controls
+        # --------------------------------------------------------------
+
+        if self.controls_visible:
+
+            self._draw_controls()
+
+        # --------------------------------------------------------------
+        # First placement only
+        # --------------------------------------------------------------
+
+        if first_build:
+
+            self._position_bottom_right()
+
+            self.window_positioned = True
+
+    # ======================================================================
     # BREATHING ANIMATION
     # ======================================================================
 
     def _animate(self):
 
-        if not self.root.winfo_exists():
+        try:
+
+            if not self.root.winfo_exists():
+
+                return
+
+        except tk.TclError:
 
             return
 
         # --------------------------------------------------------------
-        # Advance breathing phase.
+        # Update breathing phase
         # --------------------------------------------------------------
 
         self.breath_phase += BREATH_SPEED
 
         # --------------------------------------------------------------
-        # Rebuild image at slightly different vertical/horizontal scale.
+        # Remember center so the cat breathes in place.
         # --------------------------------------------------------------
 
-        current_x = self.root.winfo_x()
+        old_x = self.root.winfo_x()
 
-        current_y = self.root.winfo_y()
+        old_y = self.root.winfo_y()
 
         old_width = self.window_width
 
         old_height = self.window_height
 
-        self._rebuild_window()
-
-        new_width = self.window_width
-
-        new_height = self.window_height
-
-        # Keep the cat centered in the same place while breathing.
-        new_x = (
-            current_x
-            -
-            (new_width - old_width) // 2
+        center_x = (
+            old_x
+            +
+            old_width / 2
         )
 
-        new_y = (
-            current_y
-            -
-            (new_height - old_height) // 2
-        )
-
-        self.root.geometry(
-            f"{new_width}x{new_height}"
-            f"+{new_x}+{new_y}"
+        center_y = (
+            old_y
+            +
+            old_height / 2
         )
 
         # --------------------------------------------------------------
+        # Rebuild image.
+        # --------------------------------------------------------------
+
+        self._rebuild_window()
+
+        new_x = int(
+            center_x
+            -
+            self.window_width / 2
+        )
+
+        new_y = int(
+            center_y
+            -
+            self.window_height / 2
+        )
+
+        self.root.geometry(
+            f"{self.window_width}x{self.window_height}"
+            f"+{new_x}+{new_y}"
+        )
+
+        self.root.after(
+            ANIMATION_INTERVAL_MS,
+            self._animate,
+        )
 
     # ======================================================================
-    # CONTROLS
+    # CONTROL BUTTON
     # ======================================================================
 
     def _draw_controls(self):
@@ -641,7 +706,10 @@ class CatWindow:
 
         y = margin
 
-        # Red square.
+        # --------------------------------------------------------------
+        # Red square
+        # --------------------------------------------------------------
+
         self.canvas.create_rectangle(
             x,
             y,
@@ -656,7 +724,10 @@ class CatWindow:
             tags=("controls",),
         )
 
-        # White X.
+        # --------------------------------------------------------------
+        # White X
+        # --------------------------------------------------------------
+
         line_width = max(
             2,
             size // 7,
@@ -682,12 +753,9 @@ class CatWindow:
             tags=("controls",),
         )
 
-        # Bind click on the control region.
-        self.canvas.tag_bind(
-            "controls",
-            "<Button-1>",
-            self._close_from_control,
-        )
+    # ======================================================================
+    # CONTROL HIT TEST
+    # ======================================================================
 
     def _controls_hit(
         self,
@@ -737,15 +805,6 @@ class CatWindow:
             control_y + size
         )
 
-    def _close_from_control(
-        self,
-        event,
-    ):
-
-        del event
-
-        self._close()
-
     # ======================================================================
     # MOUSE DOWN
     # ======================================================================
@@ -755,7 +814,10 @@ class CatWindow:
         event,
     ):
 
-        # Red X has priority.
+        # --------------------------------------------------------------
+        # Close button gets priority.
+        # --------------------------------------------------------------
+
         if self.controls_visible:
 
             if self._controls_hit(
@@ -768,7 +830,7 @@ class CatWindow:
                 return
 
         # --------------------------------------------------------------
-        # Ctrl + drag = resizing.
+        # Ctrl + left drag = resize.
         # --------------------------------------------------------------
 
         ctrl_pressed = bool(
@@ -794,7 +856,7 @@ class CatWindow:
             return
 
         # --------------------------------------------------------------
-        # Normal drag = move.
+        # Normal left drag = move.
         # --------------------------------------------------------------
 
         self.dragging = True
@@ -826,6 +888,10 @@ class CatWindow:
         event,
     ):
 
+        # --------------------------------------------------------------
+        # Resize
+        # --------------------------------------------------------------
+
         if self.resizing:
 
             delta = (
@@ -847,6 +913,10 @@ class CatWindow:
             )
 
             return
+
+        # --------------------------------------------------------------
+        # Move
+        # --------------------------------------------------------------
 
         if not self.dragging:
 
@@ -892,13 +962,41 @@ class CatWindow:
 
         del event
 
-        if self.resizing:
+        self.dragging = False
 
-            self.resizing = False
+        self.resizing = False
+
+    # ======================================================================
+    # SINGLE CLICK
+    # ======================================================================
+
+    def _single_click(
+        self,
+        event,
+    ):
+
+        # A plain click toggles the controls.
+        #
+        # Double-click behavior is handled separately by Tkinter.
+        # The cat itself is not launched on a single click.
+
+        if self._controls_hit(
+            event.x,
+            event.y,
+        ):
 
             return
 
-        self.dragging = False
+        # Don't toggle controls while Ctrl-resizing.
+        if self.resizing:
+
+            return
+
+        self.controls_visible = (
+            not self.controls_visible
+        )
+
+        self._rebuild_window()
 
     # ======================================================================
     # DOUBLE CLICK
@@ -911,24 +1009,11 @@ class CatWindow:
 
         del event
 
-        # A double click is the explicit "open Nova" action.
         started = launch_nova_ui()
 
         if started:
 
             self.root.destroy()
-
-    # ======================================================================
-    # SINGLE CLICK
-    # ======================================================================
-
-    def _toggle_controls(self):
-
-        self.controls_visible = (
-            not self.controls_visible
-        )
-
-        self._rebuild_window()
 
     # ======================================================================
     # MOUSE WHEEL
@@ -939,18 +1024,13 @@ class CatWindow:
         event,
     ):
 
-        # Positive = away/up.
-        # Negative = toward/down.
-        #
-        # Wheel direction is inverted so:
-        # scroll up   -> grow
-        # scroll down -> shrink
+        if event.delta > 0:
 
-        change = (
-            0.10
-            if event.delta > 0
-            else -0.10
-        )
+            change = 0.10
+
+        else:
+
+            change = -0.10
 
         self._set_scale(
             self.scale + change
@@ -981,6 +1061,7 @@ class CatWindow:
 
             return
 
+        # Preserve the center while resizing.
         center_x = (
             self.root.winfo_x()
             +
@@ -995,6 +1076,7 @@ class CatWindow:
 
         self.scale = new_scale
 
+        # Rebuild without resetting the desktop position.
         self._rebuild_window()
 
         new_x = int(
@@ -1025,7 +1107,11 @@ class CatWindow:
 
         del event
 
-        self._toggle_controls()
+        self.controls_visible = (
+            not self.controls_visible
+        )
+
+        self._rebuild_window()
 
     # ======================================================================
     # CLOSE
@@ -1080,7 +1166,7 @@ class CatPlugin(NovaPlugin):
 
     name = "cat"
 
-    version = "1.1.0"
+    version = "1.2.0"
 
     description = (
         "Summon an animated draggable pixel cat."
