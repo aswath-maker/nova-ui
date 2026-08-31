@@ -2,32 +2,45 @@
 Nova Cat Plugin
 ===============
 
-Command:
+Public command:
 
     nova --cat
 
-Features:
-    - Uses the supplied cat.png artwork
+Behavior:
+
+    nova --cat
+        ↓
+    starts a detached desktop-cat process
+        ↓
+    terminal command finishes
+        ↓
+    cat remains alive even if CMD is closed
+
+Cat features:
+
+    - Pixel-art cat loaded from cat.png
     - Gentle breathing animation
-    - Draggable around the desktop
+    - Draggable
     - Resizable
+    - Mouse-wheel resizing
     - Red close button
-    - Double-click launches Nova GUI
     - Always on top
+    - Double-click launches nova --ui
+    - Right-click toggles controls
+    - Escape closes the cat
 
-The plugin does NOT:
-    - create another model
-    - modify Nova memory
-    - modify Nova chat storage
-    - modify CPU priority
-    - modify other processes
-    - modify Windows settings
+IMPORTANT:
+    The cat has NO cursor-following eye logic.
+    The cat.png image is displayed as-is.
 
-The cat image is loaded from:
-
-    cat.png
-
-which must be located beside this plugin.py file.
+The plugin does not modify:
+    - Nova model
+    - Nova memory
+    - Nova chat storage
+    - Nova CPU priority
+    - CPU affinity
+    - other processes
+    - Windows settings
 """
 
 from __future__ import annotations
@@ -38,6 +51,7 @@ import shutil
 import subprocess
 import sys
 import tkinter as tk
+
 
 from novatrix.plugin_system import NovaPlugin
 
@@ -53,17 +67,17 @@ MAX_SCALE = 4.0
 
 INITIAL_SCALE = 1.0
 
-# Breathing animation.
+# Gentle breathing.
 BREATH_SPEED = 0.055
 BREATH_AMOUNT = 0.035
 
-# How frequently the animation updates.
+# Animation update rate.
 ANIMATION_INTERVAL_MS = 40
 
-# Size of the red close button relative to the cat.
+# Red close-button size.
 CONTROL_SIZE_RATIO = 0.26
 
-# Ctrl-drag resize sensitivity.
+# Ctrl + drag resize sensitivity.
 RESIZE_SENSITIVITY = 0.008
 
 
@@ -75,15 +89,16 @@ def find_nova_command() -> list[str]:
     """
     Find the installed Nova command.
 
-    Prefer the `nova` executable.
+    Normally this will find:
 
-    If it is not available on PATH, fall back to the current
-    Python interpreter and the Novatrix CLI module.
+        nova.exe
+
+    If it cannot, fall back to:
+
+        python -m novatrix.nova_cli
     """
 
-    executable = shutil.which(
-        "nova"
-    )
+    executable = shutil.which("nova")
 
     if executable:
 
@@ -104,9 +119,7 @@ def find_nova_command() -> list[str]:
 
 def launch_nova_ui() -> bool:
     """
-    Launch Nova's existing graphical interface.
-
-    Equivalent to:
+    Launch:
 
         nova --ui
     """
@@ -141,6 +154,113 @@ def launch_nova_ui() -> bool:
 
 
 # ============================================================================
+# DETACHED CAT PROCESS
+# ============================================================================
+
+def launch_detached_cat() -> bool:
+    """
+    Start the actual cat as an independent Windows GUI process.
+
+    This is the important part.
+
+    `nova --cat` itself is only the launcher.
+
+    The cat receives its own Python process, detached from the
+    terminal that launched Nova.
+
+    Closing CMD therefore does not close the cat.
+    """
+
+    cat_script = os.path.abspath(
+        __file__
+    )
+
+    # ------------------------------------------------------------------
+    # Windows
+    # ------------------------------------------------------------------
+
+    if os.name == "nt":
+
+        # Windows creation flags.
+        #
+        # DETACHED_PROCESS:
+        #     Cat is not attached to the invoking console.
+        #
+        # CREATE_NEW_PROCESS_GROUP:
+        #     Gives the child its own process group.
+        #
+        # CREATE_NO_WINDOW:
+        #     Prevents a console window from being created for the
+        #     Python child.
+        #
+
+        DETACHED_PROCESS = 0x00000008
+
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+        CREATE_NO_WINDOW = 0x08000000
+
+        creation_flags = (
+            DETACHED_PROCESS
+            |
+            CREATE_NEW_PROCESS_GROUP
+            |
+            CREATE_NO_WINDOW
+        )
+
+        command = [
+            sys.executable,
+            cat_script,
+            "--cat-child",
+        ]
+
+        try:
+
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                close_fds=True,
+                creationflags=creation_flags,
+            )
+
+            return True
+
+        except OSError as error:
+
+            print(
+                (
+                    "[Nova Cat] Could not start detached cat: "
+                    f"{error}"
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+
+            return False
+
+    # ------------------------------------------------------------------
+    # Non-Windows
+    # ------------------------------------------------------------------
+    #
+    # This plugin is primarily intended for Windows.
+    #
+    # We deliberately do not implement platform-specific process
+    # detachment tricks for Linux/macOS.
+    #
+
+    print(
+        "[Nova Cat] Detached cat mode is Windows-only.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    return False
+
+
+# ============================================================================
 # CAT WINDOW
 # ============================================================================
 
@@ -151,13 +271,14 @@ class CatWindow:
         self.root = tk.Tk()
 
         # ------------------------------------------------------------------
-        # Borderless / always-on-top window
+        # Borderless window
         # ------------------------------------------------------------------
 
         self.root.overrideredirect(
             True
         )
 
+        # Keep cat above normal windows.
         self.root.attributes(
             "-topmost",
             True,
@@ -178,16 +299,21 @@ class CatWindow:
         self.controls_visible = False
 
         self.drag_start_x = 0
+
         self.drag_start_y = 0
 
         self.window_start_x = 0
+
         self.window_start_y = 0
 
         self.resize_start_y = 0
-        self.resize_start_scale = INITIAL_SCALE
+
+        self.resize_start_scale = (
+            INITIAL_SCALE
+        )
 
         # ------------------------------------------------------------------
-        # Locate cat image
+        # Find image
         # ------------------------------------------------------------------
 
         self.image_path = self._find_image()
@@ -198,11 +324,12 @@ class CatWindow:
 
             raise RuntimeError(
                 "Nova Cat could not find cat.png.\n\n"
-                "Make sure cat.png is beside plugin.py."
+                "Expected:\n"
+                "cat.png beside plugin.py"
             )
 
         # ------------------------------------------------------------------
-        # Load original image
+        # Load image
         # ------------------------------------------------------------------
 
         try:
@@ -228,7 +355,7 @@ class CatWindow:
         )
 
         # ------------------------------------------------------------------
-        # Transparent window background
+        # Transparent color
         # ------------------------------------------------------------------
 
         self.transparent_color = "#00ff00"
@@ -246,7 +373,7 @@ class CatWindow:
 
         except tk.TclError:
 
-            # Fallback for systems where transparentcolor isn't available.
+            # Fallback.
             self.transparent_color = "#000000"
 
             self.root.configure(
@@ -268,7 +395,7 @@ class CatWindow:
         self.canvas.pack()
 
         # ------------------------------------------------------------------
-        # Initial cat
+        # Initial render
         # ------------------------------------------------------------------
 
         self._rebuild_window(
@@ -294,44 +421,34 @@ class CatWindow:
             self._mouse_up,
         )
 
-        # Single click:
-        # show/hide the controls.
         self.canvas.bind(
             "<Button-1>",
             self._single_click,
             add="+",
         )
 
-        # Double click:
-        # launch Nova GUI.
         self.canvas.bind(
             "<Double-Button-1>",
             self._double_click,
         )
 
-        # Mouse wheel:
-        # resize cat.
         self.canvas.bind(
             "<MouseWheel>",
             self._mouse_wheel,
         )
 
-        # Right click:
-        # also show/hide controls.
         self.canvas.bind(
             "<Button-3>",
             self._right_click,
         )
 
-        # Escape:
-        # close the cat.
         self.root.bind(
             "<Escape>",
             self._close,
         )
 
         # ------------------------------------------------------------------
-        # Start breathing animation
+        # Begin breathing animation
         # ------------------------------------------------------------------
 
         self._animate()
@@ -342,9 +459,9 @@ class CatWindow:
 
     def _find_image(self) -> str | None:
         """
-        Find cat.png beside this plugin.py file.
+        Find cat.png beside plugin.py.
 
-        Current Nova installation structure:
+        Installed structure:
 
             ~/.nova/plugins/cat/
                 plugin.py
@@ -355,32 +472,33 @@ class CatWindow:
             os.path.abspath(__file__)
         )
 
-        path = os.path.join(
+        image_path = os.path.join(
             plugin_directory,
             CAT_IMAGE_NAME,
         )
 
-        if os.path.isfile(path):
+        if os.path.isfile(
+            image_path
+        ):
 
-            return path
+            return image_path
 
-        # Development fallback:
-        # useful when running the source file directly.
-        current_directory_path = os.path.join(
+        # Development fallback.
+        current_path = os.path.join(
             os.getcwd(),
             CAT_IMAGE_NAME,
         )
 
         if os.path.isfile(
-            current_directory_path
+            current_path
         ):
 
-            return current_directory_path
+            return current_path
 
         return None
 
     # ======================================================================
-    # INITIAL POSITION
+    # POSITION
     # ======================================================================
 
     def _position_bottom_right(self):
@@ -415,7 +533,7 @@ class CatWindow:
         )
 
     # ======================================================================
-    # CALCULATE BREATHING SIZE
+    # BREATHING SIZE
     # ======================================================================
 
     def _calculate_size(
@@ -462,7 +580,7 @@ class CatWindow:
         )
 
     # ======================================================================
-    # SCALE IMAGE
+    # IMAGE SCALING
     # ======================================================================
 
     def _scale_image(
@@ -471,12 +589,10 @@ class CatWindow:
         target_height: int,
     ):
         """
-        Scale the pixel artwork using Tkinter's native pixel-preserving
-        zoom/subsample operations.
+        Scale the pixel-art image.
 
-        No image processing or eye overlays happen here.
-
-        The PNG is simply the cat.
+        No eye manipulation occurs here.
+        The supplied PNG is the complete cat.
         """
 
         scale_x = (
@@ -550,7 +666,7 @@ class CatWindow:
         self.window_height = height
 
         # --------------------------------------------------------------
-        # Replace image
+        # Resize image
         # --------------------------------------------------------------
 
         self.current_image = (
@@ -565,6 +681,7 @@ class CatWindow:
             height=height,
         )
 
+        # Clear the canvas and redraw ONLY the supplied cat image.
         self.canvas.delete(
             "all"
         )
@@ -574,10 +691,11 @@ class CatWindow:
             height // 2,
             image=self.current_image,
             anchor="center",
+            tags=("cat",),
         )
 
         # --------------------------------------------------------------
-        # Draw optional controls
+        # Optional controls
         # --------------------------------------------------------------
 
         if self.controls_visible:
@@ -585,7 +703,7 @@ class CatWindow:
             self._draw_controls()
 
         # --------------------------------------------------------------
-        # First placement only
+        # Initial position
         # --------------------------------------------------------------
 
         if first_build:
@@ -610,14 +728,13 @@ class CatWindow:
 
             return
 
-        # --------------------------------------------------------------
-        # Update breathing phase
-        # --------------------------------------------------------------
+        # Advance animation phase.
+        self.breath_phase += (
+            BREATH_SPEED
+        )
 
-        self.breath_phase += BREATH_SPEED
-
         # --------------------------------------------------------------
-        # Remember center so the cat breathes in place.
+        # Preserve cat center while breathing.
         # --------------------------------------------------------------
 
         old_x = self.root.winfo_x()
@@ -641,7 +758,7 @@ class CatWindow:
         )
 
         # --------------------------------------------------------------
-        # Rebuild image.
+        # Rebuild image with slightly changed scale.
         # --------------------------------------------------------------
 
         self._rebuild_window()
@@ -669,7 +786,7 @@ class CatWindow:
         )
 
     # ======================================================================
-    # CONTROL BUTTON
+    # CLOSE BUTTON
     # ======================================================================
 
     def _draw_controls(self):
@@ -707,7 +824,7 @@ class CatWindow:
         y = margin
 
         # --------------------------------------------------------------
-        # Red square
+        # Red X box
         # --------------------------------------------------------------
 
         self.canvas.create_rectangle(
@@ -725,7 +842,7 @@ class CatWindow:
         )
 
         # --------------------------------------------------------------
-        # White X
+        # X
         # --------------------------------------------------------------
 
         line_width = max(
@@ -752,10 +869,6 @@ class CatWindow:
             width=line_width,
             tags=("controls",),
         )
-
-    # ======================================================================
-    # CONTROL HIT TEST
-    # ======================================================================
 
     def _controls_hit(
         self,
@@ -814,10 +927,7 @@ class CatWindow:
         event,
     ):
 
-        # --------------------------------------------------------------
-        # Close button gets priority.
-        # --------------------------------------------------------------
-
+        # Close button always wins.
         if self.controls_visible:
 
             if self._controls_hit(
@@ -830,7 +940,7 @@ class CatWindow:
                 return
 
         # --------------------------------------------------------------
-        # Ctrl + left drag = resize.
+        # Ctrl + drag = resize
         # --------------------------------------------------------------
 
         ctrl_pressed = bool(
@@ -856,7 +966,7 @@ class CatWindow:
             return
 
         # --------------------------------------------------------------
-        # Normal left drag = move.
+        # Normal drag = move
         # --------------------------------------------------------------
 
         self.dragging = True
@@ -975,23 +1085,19 @@ class CatWindow:
         event,
     ):
 
-        # A plain click toggles the controls.
+        # Do not toggle controls when clicking X.
+        if self.controls_visible:
+
+            if self._controls_hit(
+                event.x,
+                event.y,
+            ):
+
+                return
+
+        # Plain click toggles control visibility.
         #
-        # Double-click behavior is handled separately by Tkinter.
-        # The cat itself is not launched on a single click.
-
-        if self._controls_hit(
-            event.x,
-            event.y,
-        ):
-
-            return
-
-        # Don't toggle controls while Ctrl-resizing.
-        if self.resizing:
-
-            return
-
+        # Double-click will subsequently trigger the GUI launch handler.
         self.controls_visible = (
             not self.controls_visible
         )
@@ -1016,7 +1122,7 @@ class CatWindow:
             self.root.destroy()
 
     # ======================================================================
-    # MOUSE WHEEL
+    # MOUSE WHEEL RESIZE
     # ======================================================================
 
     def _mouse_wheel(
@@ -1033,7 +1139,9 @@ class CatWindow:
             change = -0.10
 
         self._set_scale(
-            self.scale + change
+            self.scale
+            +
+            change
         )
 
     # ======================================================================
@@ -1061,7 +1169,7 @@ class CatWindow:
 
             return
 
-        # Preserve the center while resizing.
+        # Preserve center.
         center_x = (
             self.root.winfo_x()
             +
@@ -1076,7 +1184,6 @@ class CatWindow:
 
         self.scale = new_scale
 
-        # Rebuild without resetting the desktop position.
         self._rebuild_window()
 
         new_x = int(
@@ -1142,20 +1249,39 @@ class CatWindow:
 
 
 # ============================================================================
-# CLI CALLBACK
+# NOVA CLI CALLBACK
 # ============================================================================
 
 def run_cat(
     args,
     runtime,
 ):
+    """
+    Public Nova command:
+
+        nova --cat
+
+    This callback does NOT run the Tkinter loop itself.
+
+    Instead it starts a completely detached child process.
+    """
 
     del args
     del runtime
 
-    cat = CatWindow()
+    started = launch_detached_cat()
 
-    cat.run()
+    if started:
+
+        print(
+            "Nova Cat summoned. 🐈"
+        )
+
+    else:
+
+        print(
+            "Nova Cat could not be started."
+        )
 
 
 # ============================================================================
@@ -1166,10 +1292,10 @@ class CatPlugin(NovaPlugin):
 
     name = "cat"
 
-    version = "1.2.0"
+    version = "1.3.0"
 
     description = (
-        "Summon an animated draggable pixel cat."
+        "Summon a detached animated desktop pixel cat."
     )
 
     plugin_api_version = 1
@@ -1183,7 +1309,7 @@ class CatPlugin(NovaPlugin):
             name="cat",
             callback=run_cat,
             help_text=(
-                "Summon an animated draggable pixel cat."
+                "Summon a detached animated pixel cat."
             ),
             action="store_true",
         )
@@ -1194,3 +1320,18 @@ class CatPlugin(NovaPlugin):
 # ============================================================================
 
 plugin = CatPlugin()
+
+
+# ============================================================================
+# DETACHED CHILD ENTRY POINT
+# ============================================================================
+
+if (
+    __name__ == "__main__"
+    and len(sys.argv) > 1
+    and sys.argv[1] == "--cat-child"
+):
+
+    cat = CatWindow()
+
+    cat.run()
