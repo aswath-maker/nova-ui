@@ -6,24 +6,24 @@ Command:
 
     nova --cat
 
-Launches a tiny always-on-top pixel cat.
+Features:
+    - Tiny pixel cat
+    - Draggable around the desktop
+    - Eyes follow the mouse cursor
+    - Left click opens Nova GUI
+    - Right click closes the cat
+    - Escape closes the cat
+    - Always on top
+    - No external image/dependency required
 
-Click the cat:
-    -> launches `nova --ui`
-
-The cat window is only a launcher.
-It does not:
-    - create a model
-    - modify Nova memory
-    - modify chats
-    - modify CPU priority
-    - modify other processes
-    - modify Windows settings
-    - modify Nova's GUI implementation
+The cat is only a launcher for Nova's GUI.
+It does not modify Nova's model, memory, CPU priority,
+or any other subsystem.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import subprocess
@@ -34,76 +34,78 @@ from novatrix.plugin_system import NovaPlugin
 
 
 # ============================================================================
-# CAT CONFIGURATION
+# CONFIGURATION
 # ============================================================================
 
-CAT_SCALE = 4
+SCALE = 5
 
-CAT_WIDTH = 16
-CAT_HEIGHT = 16
+CAT_WIDTH = 20
+CAT_HEIGHT = 18
 
 WINDOW_PADDING = 4
+
+UPDATE_INTERVAL_MS = 30
+
+DRAG_THRESHOLD = 4
 
 
 # ============================================================================
 # PIXEL CAT
 # ============================================================================
 
-# 16x16 monochrome pixel cat.
+# 20 x 18 monochrome body.
 #
 # 0 = transparent
-# 1 = black pixel
-# 2 = white pixel
+# 1 = black
+# 2 = white
 #
-# The actual background is made transparent where Windows allows it.
-#
-# We draw using rectangles rather than loading an external image, keeping
-# the plugin completely self-contained.
+# The eyes are drawn separately so that their pupils can follow
+# the actual mouse cursor.
 
 CAT = [
-    "0000001100000011",
-    "0000011100000111",
-    "0000011111111111",
-    "0000111111111111",
-    "0001111111111111",
-    "0011111111111111",
-    "0111110111101111",
-    "0111100111100111",
-    "1111111111111111",
-    "1111111111111111",
-    "1111110111101111",
-    "1111111111111111",
-    "0111111111111110",
-    "0011111111111100",
-    "0001111111111000",
-    "0000111111110000",
+    "00000011000001100000",
+    "00000111000011100000",
+    "00000111111111100000",
+    "00001111111111110000",
+    "00011111111111111000",
+    "00111111111111111100",
+    "01111111111111111110",
+    "01111111111111111110",
+    "11111111111111111111",
+    "11111111111111111111",
+    "11111111111111111111",
+    "11111111111111111111",
+    "01111111111111111110",
+    "01111111111111111110",
+    "00111111111111111100",
+    "00011111111111111000",
+    "00001111111111110000",
+    "00000111111111100000",
 ]
 
 
 # ============================================================================
-# FIND NOVA EXECUTABLE
+# FIND NOVA
 # ============================================================================
 
 def find_nova_command() -> list[str]:
     """
-    Find the command used to launch the installed Nova CLI.
+    Find the installed Nova command.
 
-    Preferred:
-        nova
-
-    Fallback:
-        current Python interpreter + novatrix.nova_cli
-
-    No shell invocation is used.
+    Prefer the console-script executable.
+    Fall back to the current Python interpreter.
     """
 
-    nova_executable = shutil.which("nova")
+    nova_executable = shutil.which(
+        "nova"
+    )
 
     if nova_executable:
-        return [nova_executable]
 
-    # Fallback for environments where the `nova` console script isn't
-    # available on PATH but the package is installed in the current Python.
+        return [
+            nova_executable
+        ]
+
     return [
         sys.executable,
         "-m",
@@ -115,18 +117,21 @@ def find_nova_command() -> list[str]:
 # LAUNCH NOVA UI
 # ============================================================================
 
-def launch_nova_ui(root: tk.Tk) -> None:
+def launch_nova_ui() -> bool:
     """
-    Launch Nova's existing GUI command.
+    Launch Nova's existing GUI.
 
-    The cat itself does not implement the GUI.
+    Returns True when the process was successfully started.
     """
 
     command = find_nova_command()
 
-    command.append("--ui")
+    command.append(
+        "--ui"
+    )
 
     try:
+
         subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -135,19 +140,17 @@ def launch_nova_ui(root: tk.Tk) -> None:
             shell=False,
         )
 
+        return True
+
     except OSError as error:
-        # Keep the cat plugin self-contained and avoid bringing down Nova.
+
         print(
-            f"[Nova Cat] Could not launch Nova UI: {error}",
+            f"[Nova Cat] Could not launch Nova GUI: {error}",
             file=sys.stderr,
             flush=True,
         )
 
-        return
-
-    # The cat is merely a launcher.
-    # Once the GUI has been requested, close the launcher process.
-    root.destroy()
+        return False
 
 
 # ============================================================================
@@ -160,17 +163,27 @@ class CatWindow:
 
         self.root = tk.Tk()
 
-        self.root.overrideredirect(True)
+        # --------------------------------------------------------------
+        # Borderless / always-on-top
+        # --------------------------------------------------------------
+
+        self.root.overrideredirect(
+            True
+        )
 
         self.root.attributes(
             "-topmost",
             True,
         )
 
-        # Windows supports this transparent-color technique in Tk.
+        # --------------------------------------------------------------
+        # Transparency
+        # --------------------------------------------------------------
+
         self.transparent_color = "#00ff00"
 
         try:
+
             self.root.configure(
                 bg=self.transparent_color
             )
@@ -181,36 +194,41 @@ class CatWindow:
             )
 
         except tk.TclError:
-            # If transparency isn't available, use black background.
+
             self.transparent_color = "#000000"
 
             self.root.configure(
                 bg=self.transparent_color
             )
 
-        width = (
-            CAT_WIDTH * CAT_SCALE
+        # --------------------------------------------------------------
+        # Size
+        # --------------------------------------------------------------
+
+        self.window_width = (
+            CAT_WIDTH * SCALE
             + WINDOW_PADDING * 2
         )
 
-        height = (
-            CAT_HEIGHT * CAT_SCALE
+        self.window_height = (
+            CAT_HEIGHT * SCALE
             + WINDOW_PADDING * 2
         )
 
         self.root.geometry(
-            f"{width}x{height}"
+            f"{self.window_width}x{self.window_height}"
         )
 
-        self._position_bottom_right(
-            width,
-            height,
-        )
+        self._position_bottom_right()
+
+        # --------------------------------------------------------------
+        # Canvas
+        # --------------------------------------------------------------
 
         self.canvas = tk.Canvas(
             self.root,
-            width=width,
-            height=height,
+            width=self.window_width,
+            height=self.window_height,
             bg=self.transparent_color,
             highlightthickness=0,
             borderwidth=0,
@@ -219,111 +237,135 @@ class CatWindow:
 
         self.canvas.pack()
 
-        self._draw_cat()
+        # --------------------------------------------------------------
+        # Internal state
+        # --------------------------------------------------------------
 
-        # Left click launches Nova UI.
+        self.dragging = False
+
+        self.drag_start_x = 0
+        self.drag_start_y = 0
+
+        self.window_start_x = 0
+        self.window_start_y = 0
+
+        self.mouse_moved_during_click = False
+
+        # --------------------------------------------------------------
+        # Draw cat
+        # --------------------------------------------------------------
+
+        self._draw_cat_body()
+
+        self._draw_eyes()
+
+        # --------------------------------------------------------------
+        # Mouse controls
+        # --------------------------------------------------------------
+
         self.canvas.bind(
-            "<Button-1>",
-            self._clicked,
+            "<ButtonPress-1>",
+            self._mouse_down,
         )
 
-        self.root.bind(
-            "<Button-1>",
-            self._clicked,
+        self.canvas.bind(
+            "<B1-Motion>",
+            self._mouse_drag,
         )
 
-        # Right click closes the cat.
+        self.canvas.bind(
+            "<ButtonRelease-1>",
+            self._mouse_up,
+        )
+
+        # Right click closes.
         self.canvas.bind(
             "<Button-3>",
             self._close,
         )
 
-        self.root.bind(
-            "<Button-3>",
-            self._close,
-        )
-
-        # Escape closes it.
         self.root.bind(
             "<Escape>",
             self._close,
         )
 
-        # Small tooltip-like title in the window manager if applicable.
-        try:
-            self.root.title(
-                "Nova Cat"
-            )
-        except tk.TclError:
-            pass
+        # --------------------------------------------------------------
+        # Start eye tracking
+        # --------------------------------------------------------------
 
-    # ----------------------------------------------------------------------
-    # Position
-    # ----------------------------------------------------------------------
+        self._update_eyes()
 
-    def _position_bottom_right(
-        self,
-        width: int,
-        height: int,
-    ):
+    # ======================================================================
+    # WINDOW POSITION
+    # ======================================================================
 
-        screen_width = self.root.winfo_screenwidth()
+    def _position_bottom_right(self):
 
-        screen_height = self.root.winfo_screenheight()
+        screen_width = (
+            self.root.winfo_screenwidth()
+        )
+
+        screen_height = (
+            self.root.winfo_screenheight()
+        )
 
         x = (
             screen_width
-            - width
-            - 25
+            - self.window_width
+            - 30
         )
 
         y = (
             screen_height
-            - height
-            - 65
+            - self.window_height
+            - 70
         )
 
         self.root.geometry(
-            f"{width}x{height}+{x}+{y}"
+            f"{self.window_width}x{self.window_height}"
+            f"+{x}+{y}"
         )
 
-    # ----------------------------------------------------------------------
-    # Draw
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # DRAW CAT BODY
+    # ======================================================================
 
-    def _draw_cat(self):
+    def _draw_cat_body(self):
 
         for y, row in enumerate(CAT):
 
             for x, pixel in enumerate(row):
 
                 if pixel == "0":
+
                     continue
 
-                # Pure monochrome pixel art.
                 if pixel == "1":
+
                     fill = "#ffffff"
+
                 else:
+
                     fill = "#000000"
 
                 x1 = (
                     WINDOW_PADDING
-                    + x * CAT_SCALE
+                    + x * SCALE
                 )
 
                 y1 = (
                     WINDOW_PADDING
-                    + y * CAT_SCALE
+                    + y * SCALE
                 )
 
                 x2 = (
                     x1
-                    + CAT_SCALE
+                    + SCALE
                 )
 
                 y2 = (
                     y1
-                    + CAT_SCALE
+                    + SCALE
                 )
 
                 self.canvas.create_rectangle(
@@ -333,26 +375,314 @@ class CatWindow:
                     y2,
                     fill=fill,
                     outline=fill,
+                    tags=("cat_body",),
                 )
 
-    # ----------------------------------------------------------------------
-    # Click
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # EYE GEOMETRY
+    # ======================================================================
 
-    def _clicked(
+    def _eye_centers(self):
+        """
+        Return the two eye centers in canvas coordinates.
+
+        These positions are deliberately fixed relative to the pixel cat.
+        """
+
+        left_eye = (
+            WINDOW_PADDING
+            + 6.2 * SCALE,
+            WINDOW_PADDING
+            + 7.3 * SCALE,
+        )
+
+        right_eye = (
+            WINDOW_PADDING
+            + 13.3 * SCALE,
+            WINDOW_PADDING
+            + 7.3 * SCALE,
+        )
+
+        return left_eye, right_eye
+
+    # ======================================================================
+    # DRAW EYES
+    # ======================================================================
+
+    def _draw_eyes(self):
+
+        self.canvas.delete(
+            "eyes"
+        )
+
+        left_eye, right_eye = (
+            self._eye_centers()
+        )
+
+        self._draw_single_eye(
+            *left_eye
+        )
+
+        self._draw_single_eye(
+            *right_eye
+        )
+
+    def _draw_single_eye(
         self,
-        event=None,
+        center_x: float,
+        center_y: float,
+    ):
+
+        # White 2x2 pixel eye socket.
+        eye_radius = SCALE * 0.9
+
+        self.canvas.create_oval(
+            center_x - eye_radius,
+            center_y - eye_radius,
+            center_x + eye_radius,
+            center_y + eye_radius,
+            fill="#ffffff",
+            outline="#ffffff",
+            tags=("eyes",),
+        )
+
+    # ======================================================================
+    # UPDATE EYES
+    # ======================================================================
+
+    def _update_eyes(self):
+
+        if not self.root.winfo_exists():
+
+            return
+
+        mouse_x = (
+            self.root.winfo_pointerx()
+        )
+
+        mouse_y = (
+            self.root.winfo_pointery()
+        )
+
+        left_eye, right_eye = (
+            self._eye_centers()
+        )
+
+        # --------------------------------------------------------------
+        # Delete old eyes and redraw sockets + pupils.
+        # --------------------------------------------------------------
+
+        self.canvas.delete(
+            "eyes"
+        )
+
+        self._update_single_eye(
+            *left_eye,
+            mouse_x,
+            mouse_y,
+        )
+
+        self._update_single_eye(
+            *right_eye,
+            mouse_x,
+            mouse_y,
+        )
+
+        self.root.after(
+            UPDATE_INTERVAL_MS,
+            self._update_eyes,
+        )
+
+    def _update_single_eye(
+        self,
+        eye_x: float,
+        eye_y: float,
+        mouse_x: int,
+        mouse_y: int,
+    ):
+
+        # --------------------------------------------------------------
+        # Eye socket
+        # --------------------------------------------------------------
+
+        eye_radius = SCALE * 0.9
+
+        self.canvas.create_oval(
+            eye_x - eye_radius,
+            eye_y - eye_radius,
+            eye_x + eye_radius,
+            eye_y + eye_radius,
+            fill="#ffffff",
+            outline="#ffffff",
+            tags=("eyes",),
+        )
+
+        # --------------------------------------------------------------
+        # Direction toward cursor
+        #
+        # Convert the global cursor position into the approximate
+        # direction from the eye.
+        # --------------------------------------------------------------
+
+        window_x = self.root.winfo_x()
+        window_y = self.root.winfo_y()
+
+        absolute_eye_x = (
+            window_x
+            + eye_x
+        )
+
+        absolute_eye_y = (
+            window_y
+            + eye_y
+        )
+
+        dx = (
+            mouse_x
+            - absolute_eye_x
+        )
+
+        dy = (
+            mouse_y
+            - absolute_eye_y
+        )
+
+        distance = math.hypot(
+            dx,
+            dy,
+        )
+
+        if distance < 1:
+
+            dx = 0
+            dy = 0
+
+        else:
+
+            dx /= distance
+            dy /= distance
+
+        # Keep pupil inside the eye.
+        pupil_distance = SCALE * 0.32
+
+        pupil_x = (
+            eye_x
+            + dx * pupil_distance
+        )
+
+        pupil_y = (
+            eye_y
+            + dy * pupil_distance
+        )
+
+        pupil_radius = SCALE * 0.38
+
+        self.canvas.create_oval(
+            pupil_x - pupil_radius,
+            pupil_y - pupil_radius,
+            pupil_x + pupil_radius,
+            pupil_y + pupil_radius,
+            fill="#000000",
+            outline="#000000",
+            tags=("eyes",),
+        )
+
+    # ======================================================================
+    # DRAGGING
+    # ======================================================================
+
+    def _mouse_down(
+        self,
+        event,
+    ):
+
+        self.dragging = True
+
+        self.mouse_moved_during_click = False
+
+        self.drag_start_x = event.x_root
+        self.drag_start_y = event.y_root
+
+        self.window_start_x = (
+            self.root.winfo_x()
+        )
+
+        self.window_start_y = (
+            self.root.winfo_y()
+        )
+
+    def _mouse_drag(
+        self,
+        event,
+    ):
+
+        if not self.dragging:
+
+            return
+
+        dx = (
+            event.x_root
+            - self.drag_start_x
+        )
+
+        dy = (
+            event.y_root
+            - self.drag_start_y
+        )
+
+        if (
+            abs(dx) > DRAG_THRESHOLD
+            or abs(dy) > DRAG_THRESHOLD
+        ):
+
+            self.mouse_moved_during_click = True
+
+        new_x = (
+            self.window_start_x
+            + dx
+        )
+
+        new_y = (
+            self.window_start_y
+            + dy
+        )
+
+        self.root.geometry(
+            f"{self.window_width}x{self.window_height}"
+            f"+{new_x}+{new_y}"
+        )
+
+    def _mouse_up(
+        self,
+        event,
     ):
 
         del event
 
-        launch_nova_ui(
-            self.root
-        )
+        self.dragging = False
 
-    # ----------------------------------------------------------------------
-    # Close
-    # ----------------------------------------------------------------------
+        # A plain click launches Nova.
+        #
+        # A drag does not.
+        if not self.mouse_moved_during_click:
+
+            self._open_nova()
+
+    # ======================================================================
+    # OPEN NOVA
+    # ======================================================================
+
+    def _open_nova(self):
+
+        started = launch_nova_ui()
+
+        if started:
+
+            self.root.destroy()
+
+    # ======================================================================
+    # CLOSE
+    # ======================================================================
 
     def _close(
         self,
@@ -363,9 +693,9 @@ class CatWindow:
 
         self.root.destroy()
 
-    # ----------------------------------------------------------------------
-    # Run
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # RUN
+    # ======================================================================
 
     def run(self):
 
@@ -401,8 +731,10 @@ def run_cat(
 class CatPlugin(NovaPlugin):
 
     name = "cat"
-    version = "1.0.0"
-    description = "Summon a tiny pixel cat that launches Nova's GUI."
+    version = "1.1.0"
+    description = (
+        "Summon a draggable pixel cat that launches Nova's GUI."
+    )
     plugin_api_version = 1
 
     def register(
@@ -413,13 +745,15 @@ class CatPlugin(NovaPlugin):
         nova_runtime.register_cli_command(
             name="cat",
             callback=run_cat,
-            help_text="Summon a tiny pixel cat that launches Nova GUI.",
+            help_text=(
+                "Summon a draggable pixel cat that launches Nova GUI."
+            ),
             action="store_true",
         )
 
 
 # ============================================================================
-# REQUIRED PLUGIN EXPORT
+# REQUIRED NOVA PLUGIN EXPORT
 # ============================================================================
 
 plugin = CatPlugin()
